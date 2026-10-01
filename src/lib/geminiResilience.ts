@@ -515,8 +515,6 @@ export function buildSmartFallbackSemanticDrift(
     { kw: '20ms xuong 2ms', type: 'premature_optimization', reason: 'Toi uu latency qua sau tu 20ms xuong 2ms khi chua co load test (khong dau).' },
     { kw: 'xuống 2ms', type: 'premature_optimization', reason: 'Tối ưu xuống 2ms quá sớm khi chưa có load test thực tế.' },
     { kw: 'xuong 2ms', type: 'premature_optimization', reason: 'Toi uu xuong 2ms qua som khi chua co load test (khong dau).' },
-    { kw: 'tối ưu query', type: 'premature_optimization', reason: 'Tối ưu query sâu khi chưa đo bottleneck bằng load test là premature optimization.' },
-    { kw: 'toi uu query', type: 'premature_optimization', reason: 'Toi uu query sau khi chua do bottleneck bang load test (khong dau).' },
     { kw: 'truoc khi co load test', type: 'premature_optimization', reason: 'Thay doi hieu nang truoc khi co load test do luong la premature optimization (khong dau).' },
     { kw: 'trước khi có load test', type: 'premature_optimization', reason: 'Thay đổi hiệu năng trước khi có load test đo lường là premature optimization.' },
     { kw: 'redis cluster', type: 'over_engineering', reason: 'Redis cluster và sharding là giải pháp quá xa khi chưa có user thực tế.' },

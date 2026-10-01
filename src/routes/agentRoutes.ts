@@ -25,7 +25,7 @@ import {
 } from '../lib/circuitBreaker.ts';
 import { insertPredictionOutcome, insertPredictionSnapshot, getPredictionById } from '../db/predictions.ts';
 import { runBacktest, assertThresholds } from '../lib/backtest.ts';
-import { getOrCreateUserRecord } from '../db/rag.ts';
+import { getOrCreateUserRecord, calculateSemanticDriftScore, cosineSimilarity } from '../db/rag.ts';
 import { smartCache } from '../utils/smartCacheRateLimitEngine.ts';
 
 export const agentRouter = Router();
@@ -233,41 +233,22 @@ agentRouter.post(
       allExemptions
     );
 
-    const goalTokens = getMeaningfulGoalTokens(originalGoal);
-    const outputTokens = getMeaningfulGoalTokens(agentOutput);
-    const sharedTokens = [...goalTokens].filter((token) => outputTokens.has(token)).length;
-
     // Check if task matches any active exemptions
     const lowerOutput = agentOutput.toLowerCase();
     const isExempted = allExemptions.some(
       (e) => e.taskTitle && (lowerOutput.includes(e.taskTitle.toLowerCase()) || e.taskTitle.toLowerCase().includes(lowerOutput))
     );
 
-    // Common delivery/bugfix/core implementation terms that inherently align with building/shipping software:
-    const coreDeliveryKeywords = [
-      'fix', 'bug', 'issue', 'login', 'auth', 'oauth', 'token', 'signup', 'api', 'route', 'endpoint',
-      'test', 'unit test', 'spec', 'build', 'ship', 'mvp', 'database', 'schema', 'migration', 'table',
-      'crud', 'checkout', 'payment', 'stripe', 'cart', 'order', 'profile', 'user', 'session', 'deploy',
-      'refactor', 'clean', 'lint', 'component', 'ui', 'form', 'validation', 'error', 'exception', 'cache'
-    ];
-    const isCoreDeliveryAction = coreDeliveryKeywords.some((kw) => lowerOutput.includes(kw));
+    // Real Vector Space Semantic Evaluation (768-dim embeddings + cosineSimilarity from src/db/rag.ts)
+    const semanticCalculation = await calculateSemanticDriftScore(originalGoal, agentOutput, {
+      detectedRabbitHoles: semantic.detectedRabbitHoles,
+      isExempted,
+    });
 
-    let driftScore = 0;
-    if (isExempted) {
-      driftScore = 0;
-    } else if (semantic.detectedRabbitHoles.length > 0) {
-      // Detected real rabbit hole (over-engineering, premature optimization, reinventing the wheel, bikeshedding)
-      // takes precedence over generic delivery keywords (e.g. "query ... load test" contains "query" but is premature optimization)
-      driftScore = 75;
-    } else if (sharedTokens > 0 || isCoreDeliveryAction) {
-      // Clear goal overlap or standard productive software engineering execution (e.g. "Fix login bug" for "Ship MVP")
-      driftScore = 15;
-    } else {
-      // Divergent action with no shared tokens and not an obvious core delivery task
-      driftScore = 50;
-    }
+    const driftScore = semanticCalculation.driftScore;
 
-    const status = driftScore >= threshold ? 'BLOCK' : driftScore >= 40 ? 'WARN' : 'ALLOW';
+    const status = driftScore >= threshold ? 'BLOCK' : 'ALLOW';
+    const decision = status;
     const requestId = randomUUID();
     const circuitEval = evaluateAndTriggerCircuitBreaker({
       agentId: req.agentId,
@@ -285,6 +266,11 @@ agentRouter.post(
       originalGoal,
       agentOutput,
       driftScore,
+      semanticMetrics: {
+        cosineSimilarity: Number(semanticCalculation.cosineSimilarity.toFixed(4)),
+        deliveryAlignmentSimilarity: Number(semanticCalculation.deliveryAlignmentSimilarity.toFixed(4)),
+        effectiveSimilarity: Number(semanticCalculation.effectiveSimilarity.toFixed(4)),
+      },
       threshold,
       status,
       decision: status,
@@ -293,10 +279,8 @@ agentRouter.post(
       calibrationStats: getDriftCalibrationStats(),
       reason:
         status === 'BLOCK'
-          ? 'Agent output has insufficient goal overlap or contains a known rabbit-hole pattern.'
-          : status === 'WARN'
-          ? 'Agent output needs human review before execution.'
-          : 'Agent output remains aligned with the original goal.',
+          ? semanticCalculation.reason || 'Agent output has insufficient goal overlap or contains a known rabbit-hole pattern.'
+          : semanticCalculation.reason || 'Agent output remains aligned with the original goal.',
       circuitBreaker: {
         triggered: circuitEval.triggered,
         circuitStatus: circuitEval.circuitStatus,

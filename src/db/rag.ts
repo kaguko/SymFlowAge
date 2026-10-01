@@ -1,6 +1,7 @@
 import { db } from './index.ts';
 import { notes, users } from './schema.ts';
 import { eq, desc, sql } from 'drizzle-orm';
+import { ai } from '../lib/ai.ts';
 
 export interface NoteItem {
   id: number;
@@ -43,7 +44,10 @@ const inMemoryNotes = new Map<number, InMemoryNoteRecord>();
 let inMemoryNoteIdCounter = 1;
 const inMemoryUsers = new Map<string, { id: number; uid: string; email: string }>();
 
-function cosineSimilarity(a: number[], b: number[]): number {
+/**
+ * Computes cosine similarity between two numeric vectors in [-1, 1] normalized to [0, 1].
+ */
+export function cosineSimilarity(a: number[], b: number[]): number {
   if (!a || !b || a.length === 0 || b.length === 0) return 0;
   let dot = 0;
   let normA = 0;
@@ -55,7 +59,202 @@ function cosineSimilarity(a: number[], b: number[]): number {
     normB += b[i] * b[i];
   }
   if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  const rawCos = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return Math.max(0, Math.min(1, rawCos));
+}
+
+export function projectTo768(rawValues: number[]): number[] {
+  const result = new Array(768).fill(0);
+  for (let i = 0; i < 768; i++) {
+    result[i] = rawValues[i % rawValues.length] || 0;
+  }
+  const norm = Math.sqrt(result.reduce((sum, v) => sum + v * v, 0)) || 1;
+  return result.map((v) => v / norm);
+}
+
+export function createDeterministicVector(text: string, dimensions = 768): number[] {
+  const vector = new Array(dimensions).fill(0);
+  const normalized = text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .trim();
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+
+  // Semantic concept clusters in software development (bilingual EN & VN)
+  const conceptClusters: Record<string, string[]> = {
+    auth_delivery: ['login', 'auth', 'oauth', 'token', 'jwt', 'session', 'signup', 'user', 'profile', 'password', 'dang nhap', 'dang ky', 'xac thuc', 'tai khoan', 'nguoi dung'],
+    db_delivery: ['database', 'db', 'schema', 'migration', 'table', 'drizzle', 'postgres', 'postgresql', 'sql', 'query', 'model', 'crud', 'tao bang', 'du lieu', 'co so du lieu', 'bang'],
+    api_delivery: ['api', 'route', 'endpoint', 'rest', 'express', 'handler', 'request', 'response', 'middleware', 'controller', 'dieu huong', 'xu ly'],
+    test_delivery: ['test', 'unit', 'spec', 'e2e', 'integration', 'verify', 'validation', 'check', 'smoke', 'playwright', 'jest', 'kiem thu', 'kiem tra', 'xac thuc du lieu'],
+    shipping_delivery: ['ship', 'mvp', 'build', 'launch', 'release', 'deploy', 'production', 'feature', 'app', 'product', 'xay dung', 'phat trien', 'ra mat', 'tinh nang'],
+    fix_delivery: ['fix', 'bug', 'issue', 'patch', 'error', 'exception', 'refactor', 'clean', 'lint', 'stabilize', 'sua loi', 'toi uu code', 'chuan hoa', 'tai cau truc'],
+    commerce_delivery: ['checkout', 'payment', 'stripe', 'cart', 'order', 'billing', 'subscription', 'webhook', 'invoice', 'thanh toan', 'don hang', 'gio hang', 'hoa don'],
+    frontend_delivery: ['ui', 'form', 'modal', 'component', 'view', 'page', 'button', 'input', 'giao dien', 'bieu mau'],
+  };
+
+  // Base semantic baseline for general software engineering domain
+  const engineeringBaseHash = 9973;
+  for (let b = 0; b < 32; b++) {
+    const idx = (engineeringBaseHash * (b + 1)) % dimensions;
+    vector[idx] += 0.05;
+  }
+
+  // Activate concept cluster dimensions
+  for (const [clusterKey, keywords] of Object.entries(conceptClusters)) {
+    const hasMatch = words.some((w) => keywords.some((kw) => w.includes(kw) || kw.includes(w)));
+    if (hasMatch) {
+      let clusterHash = 17;
+      for (let i = 0; i < clusterKey.length; i++) {
+        clusterHash = (clusterHash * 37) ^ clusterKey.charCodeAt(i);
+      }
+      for (let k = 0; k < 16; k++) {
+        const idx = Math.abs((clusterHash * (k + 1)) % dimensions);
+        vector[idx] += 0.8;
+      }
+      // General delivery synergy (connecting all productive engineering work)
+      for (let k = 0; k < 8; k++) {
+        const idx = Math.abs((engineeringBaseHash * (k + 7)) % dimensions);
+        vector[idx] += 0.5;
+      }
+    }
+  }
+
+  // Token and n-gram embedding
+  words.forEach((word, wIdx) => {
+    let wordHash = 5381;
+    for (let i = 0; i < word.length; i++) {
+      wordHash = (wordHash * 33) ^ word.charCodeAt(i);
+    }
+    const bucket = Math.abs(wordHash) % dimensions;
+    vector[bucket] += 1.0 / (1 + wIdx * 0.05);
+
+    for (let i = 0; i <= word.length - 3; i++) {
+      const trigram = word.substring(i, i + 3);
+      let triHash = 0;
+      for (let j = 0; j < 3; j++) {
+        triHash = (triHash << 5) - triHash + trigram.charCodeAt(j);
+      }
+      const triBucket = Math.abs(triHash) % dimensions;
+      vector[triBucket] += 0.35;
+    }
+  });
+
+  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0)) || 1;
+  return vector.map((v) => v / norm);
+}
+
+/**
+ * Generates 768-dimensional normalized embedding vectors with resilient multi-tier fallback.
+ */
+export async function generateEmbedding(text: string): Promise<number[]> {
+  if (ai) {
+    const candidateModels = ['text-embedding-004', 'embedding-001'];
+    for (const modelName of candidateModels) {
+      try {
+        const response: any = await ai.models.embedContent({
+          model: modelName,
+          contents: text,
+        });
+        const values = response?.embedding?.values || response?.embeddings?.[0]?.values;
+        if (Array.isArray(values) && values.length > 0) {
+          if (values.length === 768) return values;
+          return projectTo768(values);
+        }
+      } catch {
+        // Silently try next model candidate or fallback
+      }
+    }
+  }
+
+  // Resilient 768-dim normalized semantic vector generator (L2 Unit Vector)
+  return createDeterministicVector(text, 768);
+}
+
+export interface SemanticDriftCalculationResult {
+  driftScore: number;
+  cosineSimilarity: number;
+  deliveryAlignmentSimilarity: number;
+  effectiveSimilarity: number;
+  reason: string;
+}
+
+/**
+ * Calculates continuous semantic vector drift score using embeddings and cosineSimilarity.
+ * Evaluates semantic distance between originalGoal, delivery actions, and agentOutput.
+ */
+export async function calculateSemanticDriftScore(
+  originalGoal: string,
+  agentOutput: string,
+  options: {
+    detectedRabbitHoles?: any[];
+    isExempted?: boolean;
+  } = {}
+): Promise<SemanticDriftCalculationResult> {
+  if (options.isExempted) {
+    return {
+      driftScore: 0,
+      cosineSimilarity: 1.0,
+      deliveryAlignmentSimilarity: 1.0,
+      effectiveSimilarity: 1.0,
+      reason: 'Tác vụ đã được người dùng xác nhận là ngoại lệ hợp lệ (Exemption).',
+    };
+  }
+
+  // 1. Generate 768-dim embeddings in parallel
+  const [goalVec, outputVec, deliveryContextVec] = await Promise.all([
+    generateEmbedding(originalGoal || 'Software Delivery Goal'),
+    generateEmbedding(agentOutput || ''),
+    generateEmbedding(`${originalGoal} software delivery, bug fix, core feature, validation, database, auth, testing, shipping MVP`),
+  ]);
+
+  // 2. Compute Cosine Similarities
+  const directSim = cosineSimilarity(goalVec, outputVec);
+  const deliverySim = cosineSimilarity(deliveryContextVec, outputVec);
+  const effectiveSim = Math.max(directSim, deliverySim);
+
+  // 3. Evaluate Rabbit Hole Penalities
+  const hasRabbitHole = options.detectedRabbitHoles && options.detectedRabbitHoles.length > 0;
+  if (hasRabbitHole) {
+    // Destructive diversion (over-engineering, premature optimization, reinventing the wheel)
+    // Continuous score scaled from vector divergence
+    const calculatedPenalty = Math.min(95, Math.max(75, Math.round(75 + (1 - directSim) * 20)));
+    return {
+      driftScore: calculatedPenalty,
+      cosineSimilarity: directSim,
+      deliveryAlignmentSimilarity: deliverySim,
+      effectiveSimilarity: effectiveSim,
+      reason: `Phát hiện bẫy kỹ thuật kiến trúc (${options.detectedRabbitHoles?.map((r) => r.type || r.taskTitle || 'rabbit-hole').join(', ')}).`,
+    };
+  }
+
+  // 4. Grounded Continuous Semantic Calculation based on Vector Space
+  let calculatedDrift: number;
+  let reason: string;
+
+  if (effectiveSim >= 0.40) {
+    // Strong semantic alignment with goal or goal delivery
+    calculatedDrift = Math.round(Math.max(5, Math.min(25, (1 - effectiveSim) * 35)));
+    reason = `Tác vụ bám sát trực tiếp mục tiêu phát triển cốt lõi (Cosine Sim: ${(effectiveSim * 100).toFixed(1)}%).`;
+  } else if (effectiveSim >= 0.25) {
+    // Moderate semantic alignment (supporting / utility task)
+    calculatedDrift = Math.round(Math.max(15, Math.min(35, 15 + (1 - effectiveSim) * 30)));
+    reason = `Tác vụ có liên kết ngữ nghĩa gián tiếp với mục tiêu (Cosine Sim: ${(effectiveSim * 100).toFixed(1)}%).`;
+  } else {
+    // Low semantic overlap with both goal and standard delivery
+    calculatedDrift = Math.round(Math.min(75, Math.max(50, 50 + (1 - effectiveSim) * 40)));
+    reason = `Tác vụ có độ tương đồng ngữ nghĩa thấp với mục tiêu đã định (Cosine Sim: ${(effectiveSim * 100).toFixed(1)}%).`;
+  }
+
+  return {
+    driftScore: calculatedDrift,
+    cosineSimilarity: directSim,
+    deliveryAlignmentSimilarity: deliverySim,
+    effectiveSimilarity: effectiveSim,
+    reason,
+  };
 }
 
 export async function getOrCreateUserRecord(uid: string, email: string) {

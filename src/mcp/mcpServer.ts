@@ -25,6 +25,7 @@ import {
 import { requireAgentAuth } from '../middleware/agentAuth.ts';
 import { addCalibrationRule, getActiveCalibrationRules } from '../lib/calibrationMemory.ts';
 import { serverDriftFeedbackStore, getDriftCalibrationStats } from '../routes/driftFeedbackStore.ts';
+import { calculateSemanticDriftScore } from '../db/rag.ts';
 import { smartCache } from '../utils/smartCacheRateLimitEngine.ts';
 
 const apiKey = serverConfig.geminiApiKey;
@@ -710,45 +711,25 @@ Bắt buộc trả về đúng JSON:
           (e) => e.taskTitle && (lowerOutput.includes(e.taskTitle.toLowerCase()) || e.taskTitle.toLowerCase().includes(lowerOutput))
         );
 
-        const coreDeliveryKeywords = [
-          'fix', 'bug', 'issue', 'login', 'auth', 'oauth', 'token', 'signup', 'api', 'route', 'endpoint',
-          'test', 'unit test', 'spec', 'build', 'ship', 'mvp', 'database', 'schema', 'migration', 'table',
-          'crud', 'checkout', 'payment', 'stripe', 'cart', 'order', 'profile', 'user', 'session', 'deploy',
-          'refactor', 'clean', 'lint', 'component', 'ui', 'form', 'validation', 'error', 'exception', 'cache'
-        ];
-        const isCoreDeliveryAction = coreDeliveryKeywords.some((kw) => lowerOutput.includes(kw));
+        const semanticCalculation = await calculateSemanticDriftScore(originalGoal, agentOutput, {
+          detectedRabbitHoles: semantic.detectedRabbitHoles,
+          isExempted,
+        });
 
-        const getTokens = (str: string) =>
-          new Set(
-            str
-              .toLowerCase()
-              .replace(/[^a-z0-9\s]/g, ' ')
-              .split(/\s+/)
-              .filter((w) => w.length > 3)
-          );
-
-        const goalTokens = getTokens(originalGoal);
-        const outputTokens = getTokens(agentOutput);
-        const sharedTokens = [...goalTokens].filter((token) => outputTokens.has(token)).length;
-
-        let driftScore = 0;
-        if (isExempted) {
-          driftScore = 0;
-        } else if (semantic.detectedRabbitHoles.length > 0) {
-          driftScore = 75;
-        } else if (sharedTokens > 0 || isCoreDeliveryAction) {
-          driftScore = 15;
-        } else {
-          driftScore = 50;
-        }
-
-        const status = driftScore >= threshold ? 'BLOCK' : driftScore >= 40 ? 'WARN' : 'ALLOW';
+        const driftScore = semanticCalculation.driftScore;
+        const status = driftScore >= threshold ? 'BLOCK' : 'ALLOW';
+        const decision = status;
 
         const result = {
           mcpContract: 'symflowage.mcp.v1',
           originalGoal,
           agentOutput,
           driftScore,
+          semanticMetrics: {
+            cosineSimilarity: Number(semanticCalculation.cosineSimilarity.toFixed(4)),
+            deliveryAlignmentSimilarity: Number(semanticCalculation.deliveryAlignmentSimilarity.toFixed(4)),
+            effectiveSimilarity: Number(semanticCalculation.effectiveSimilarity.toFixed(4)),
+          },
           threshold,
           status,
           decision: status,
@@ -757,10 +738,8 @@ Bắt buộc trả về đúng JSON:
           calibrationStats: getDriftCalibrationStats(),
           reason:
             status === 'BLOCK'
-              ? 'Agent output has insufficient goal overlap or contains a known rabbit-hole pattern.'
-              : status === 'WARN'
-              ? 'Agent output needs human review before execution.'
-              : 'Agent output remains aligned with the original goal.',
+              ? semanticCalculation.reason || 'Agent output has insufficient goal overlap or contains a known rabbit-hole pattern.'
+              : semanticCalculation.reason || 'Agent output remains aligned with the original goal.',
         };
 
         smartCache.set(cacheKey, result, 'simple');

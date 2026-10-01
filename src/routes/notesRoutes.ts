@@ -6,75 +6,13 @@ import {
   deleteNote,
   searchNotesSemantic,
   getOrCreateUserRecord,
+  generateEmbedding,
 } from '../db/rag.ts';
 import { ai } from '../lib/ai.ts';
 import { generateContentWithFallback } from '../lib/geminiResilience.ts';
 import { Modality } from '@google/genai';
 
 export const notesRouter = Router();
-
-// Generate 768-dim embeddings with resilient multi-tier fallback
-async function generateEmbedding(text: string): Promise<number[]> {
-  if (ai) {
-    const candidateModels = ['text-embedding-004', 'embedding-001'];
-    for (const modelName of candidateModels) {
-      try {
-        const response: any = await ai.models.embedContent({
-          model: modelName,
-          contents: text,
-        });
-        const values = response?.embedding?.values || response?.embeddings?.[0]?.values;
-        if (Array.isArray(values) && values.length > 0) {
-          if (values.length === 768) return values;
-          // Project or trim/pad to 768 dimensions
-          return projectTo768(values);
-        }
-      } catch {
-        // Silently try next model candidate or fallback
-      }
-    }
-  }
-
-  // Resilient 768-dim normalized semantic vector generator (L2 Unit Vector)
-  return createDeterministicVector(text, 768);
-}
-
-function projectTo768(rawValues: number[]): number[] {
-  const result = new Array(768).fill(0);
-  for (let i = 0; i < 768; i++) {
-    result[i] = rawValues[i % rawValues.length] || 0;
-  }
-  const norm = Math.sqrt(result.reduce((sum, v) => sum + v * v, 0)) || 1;
-  return result.map((v) => v / norm);
-}
-
-function createDeterministicVector(text: string, dimensions = 768): number[] {
-  const vector = new Array(dimensions).fill(0);
-  const normalized = text.toLowerCase().trim();
-  const words = normalized.split(/\s+/);
-
-  words.forEach((word, wIdx) => {
-    let wordHash = 5381;
-    for (let i = 0; i < word.length; i++) {
-      wordHash = (wordHash * 33) ^ word.charCodeAt(i);
-    }
-    const bucket = Math.abs(wordHash) % dimensions;
-    vector[bucket] += 1.0 / (1 + wIdx * 0.05);
-
-    for (let i = 0; i <= word.length - 3; i++) {
-      const trigram = word.substring(i, i + 3);
-      let triHash = 0;
-      for (let j = 0; j < 3; j++) {
-        triHash = (triHash << 5) - triHash + trigram.charCodeAt(j);
-      }
-      const triBucket = Math.abs(triHash) % dimensions;
-      vector[triBucket] += 0.35;
-    }
-  });
-
-  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0)) || 1;
-  return vector.map((v) => v / norm);
-}
 
 // GET /api/notes - List user notes and documents
 notesRouter.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
