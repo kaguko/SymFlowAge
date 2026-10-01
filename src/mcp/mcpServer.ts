@@ -23,6 +23,7 @@ import {
   registerSseAlertSubscriber,
 } from '../lib/circuitBreaker.ts';
 import { requireAgentAuth } from '../middleware/agentAuth.ts';
+import { issueStreamTicket, requireStreamAuth } from '../middleware/streamAuth.ts';
 import { addCalibrationRule, getActiveCalibrationRules } from '../lib/calibrationMemory.ts';
 import { serverDriftFeedbackStore, getDriftCalibrationStats } from '../routes/driftFeedbackStore.ts';
 import { calculateSemanticDriftScore } from '../db/rag.ts';
@@ -1017,7 +1018,9 @@ const sseTransports = new Map<string, SSEServerTransport>();
  * Express HTTP & SSE endpoint handlers for MCP Server integration
  */
 export function mountMcpRoutes(app: any) {
-  app.get('/api/agent/activity/stream', (_req: any, res: any) => {
+  app.post('/api/agent/activity/ticket', issueStreamTicket);
+
+  app.get('/api/agent/activity/stream', requireStreamAuth, (_req: any, res: any) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');

@@ -18,11 +18,12 @@
 6. [Tính năng](#-tính-năng)
 7. [Tech stack & cấu trúc](#-tech-stack--cấu-trúc)
 8. [API](#-api)
-9. [Circuit Breaker & MCP](#-circuit-breaker--mcp)
-10. [Gemini Resilience](#-gemini-resilience)
-11. [Cài đặt & biến môi trường](#-cài-đặt--biến-môi-trường)
-12. [Kiểm thử](#-kiểm-thử)
-13. [Tác giả & bản quyền](#-tác-giả--bản-quyền)
+9. [Bảo mật production](#-bảo-mật-production)
+10. [Circuit Breaker & MCP](#-circuit-breaker--mcp)
+11. [Gemini Resilience](#-gemini-resilience)
+12. [Cài đặt & biến môi trường](#-cài-đặt--biến-môi-trường)
+13. [Kiểm thử](#-kiểm-thử)
+14. [Tác giả & bản quyền](#-tác-giả--bản-quyền)
 
 ---
 
@@ -75,14 +76,19 @@ Mẫu kết quả với embedding thật (mục tiêu "Build a Node.js payment A
 - **Hộp cảnh báo rabbit hole** (`over_engineering`, `premature_optimization`, `reinventing_wheel`, `scope_creep`, `bike_shedding`) và nút 1-click **"Báo False Positive"** → `calibrationMemory`.
 - **Effort Sync & Status LED**: `DECOMPOSING` / `EXECUTING` / `GUARDRAIL_CHECK` / `HALT_EXECUTION` / `IDLE`; elapsed vs estimated budget.
 - **Predictive Horizon View**: 3 timeline (Optimal 68% / Status Quo Drift 24% / Bottleneck Crash 8%) và "Lock Flow".
-- **MCP orchestration & telemetry**: `decompose`, `guardrail`, `outcome`, `accuracy` qua JSON-RPC/SSE; UI đồng bộ qua `GET /api/agent/activity/stream` (chỉ metadata, phù hợp local/internal — cần xác thực và tách channel theo user trước khi mở ra internet).
+- **MCP orchestration & telemetry**: `decompose`, `guardrail`, `outcome`, `accuracy` qua JSON-RPC/SSE; UI đồng bộ qua `GET /api/agent/activity/stream` (chỉ metadata; **yêu cầu xác thực**, xem [Bảo mật production](#-bảo-mật-production)).
 - **Persistent Calibration Memory**: rule từ outcome `DRIFT`/`CRASH`/`FALSE_POSITIVE` lưu atomically ở `.data/calibration-memory.json`.
 - **Heavy / high-frequency agent**: WebSocket duplex `/ws/agent/stream` (~8.269 steps/s), hàng đợi async `POST /api/v1/agent/async/enqueue` (ACK < 2ms, backpressure), cache đa tầng write-behind (`tests/heavy-agent.spec.ts`).
 - **Smart Cache** cho `/decompose` và `/guardrail/drift-check`: lần lặp trả `X-Cache-Status: HIT`, < 1ms, 0 token; thống kê ở `GET /api/smart-cache-stats`.
 - **Chống báo động giả**: ngưỡng `circuitBreakerThreshold` mặc định `65`; API/MCP "Đây KHÔNG phải Rabbit Hole" (`POST|GET /api/v1/agent/guardrail/exemptions`, `DELETE …/:id`, tool `symflowage_report_false_positive`).
 - **Load test** (K6 spike 2.000 VUs: 65.762 req, 0 lỗi 5xx; ramp-up tới 5.000 VUs: 123.558 req, 0% lỗi; Autocannon đỉnh 2.656 req/s). Vùng vận hành an toàn ≤ ~1.500 kết nối; trên đó suy thoái êm ái.
 
-### Thay đổi mới nhất (Guardrail semantic thật)
+### Thay đổi mới nhất
+**Khóa bảo mật production**
+- `/api/agent/activity/stream` không còn mở: cần API key (agent/tenant) ở header hoặc ticket dùng một lần; ticket cấp qua `POST /api/agent/activity/ticket` bằng Firebase ID token (UI) hoặc API key.
+- Production không khởi động nếu thiếu `DATABASE_URL`/`SQL_HOST`; in-memory chỉ là chế độ suy giảm khi DB đã cấu hình bị lỗi (có log và đếm tại `/api/health`).
+
+**Guardrail semantic thật**
 - `driftScore` ở `agentRoutes.ts` và MCP dùng `calculateSemanticDriftScore` (embedding + `cosineSimilarity`) thay cho bảng 0/15/50/75.
 - Sửa model embedding (`gemini-embedding-001`, 768 chiều, chuẩn hóa L2) — model cũ trả 404 nên trước đó luôn dùng fallback.
 - Nhận diện rabbit hole bằng archetype trong không gian vector; phạt liên tục theo mức chênh thay vì sàn 75.
@@ -252,6 +258,14 @@ curl -X POST "$APP_URL/api/v1/agent/guardrail/drift-check" \
 
 ---
 
+## 🔒 Bảo Mật Production
+
+- **Activity stream**: `GET /api/agent/activity/stream` trả `401` nếu không có credential hợp lệ. Cách vào: (1) header `Authorization: Bearer <API key>` (M2M hoặc `sk_live_…`), hoặc (2) `?ticket=` — ticket một lần, sống 30 giây, lấy bằng `POST /api/agent/activity/ticket` với Firebase ID token (verify nghiêm ngặt, không guest) hoặc API key. Browser dùng `EventSource` nên phải đổi ticket; secret dài hạn không xuất hiện trong URL. UI chỉ kết nối khi người dùng đã đăng nhập Firebase.
+- **Database**: khi `NODE_ENV=production` mà không có `DATABASE_URL`/`SQL_HOST`, server từ chối khởi động. Ngoại lệ tường minh: `SYMFLOWAGE_ALLOW_INMEMORY=1` (chỉ demo, dữ liệu mất khi restart, có log lỗi). Khi DB đã cấu hình nhưng lỗi lúc chạy, các store (`notes`, `users`) tạm dùng in-memory, ghi log `[DB FALLBACK]` và đếm ở `GET /api/health` → `database.fallbackEvents`.
+- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa được tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); `requireAuth` của các route notes vẫn fallback sang guest khi thiếu/sai token; tenant & API key billing đang lưu in-memory (mất khi restart, DB chỉ ghi best-effort); server chưa đọc biến `PORT`.
+
+---
+
 ## 🚨 Circuit Breaker & MCP
 
 MCP có 2 transport: HTTP JSON-RPC `POST /api/mcp` và SSE `GET /api/mcp/sse` + `POST /api/mcp/messages`; cả hai yêu cầu Bearer M2M key. SSE chỉ dành cho MCP client và guardrail alert, khác với telemetry UI `/api/agent/activity/stream`.
@@ -290,7 +304,8 @@ Firebase Auth (tùy chọn): tạo `.env.local` (đã git-ignored) với `VITE_F
 | `SYMFLOWAGE_CALIBRATION_MEMORY_PATH` | Không | Mặc định `.data/calibration-memory.json` |
 | `SYMFLOWAGE_WEBHOOK_URL` | Không | Webhook cho Circuit Breaker |
 | `APP_URL` | Không | URL triển khai |
-| `DATABASE_URL` | Không | PostgreSQL cho pgvector semantic search |
+| `DATABASE_URL` / `SQL_HOST` | **Bắt buộc ở production** | PostgreSQL (pgvector); thiếu thì production không khởi động |
+| `SYMFLOWAGE_ALLOW_INMEMORY` | Không | `1` cho phép production chạy không DB (chỉ demo) |
 | `VITE_FIREBASE_*` | Không | `API_KEY`, `PROJECT_ID`, `AUTH_DOMAIN`, `STORAGE_BUCKET`, `MESSAGING_SENDER_ID`, `APP_ID`, `MEASUREMENT_ID` |
 
 ---

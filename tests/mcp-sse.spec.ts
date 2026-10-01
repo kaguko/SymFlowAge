@@ -55,9 +55,34 @@ test.describe('MCP SSE transport', () => {
     controller.abort();
   });
 
+  test('rejects unauthenticated or forged access to the activity stream', async ({ request }) => {
+    expect((await request.get('/api/agent/activity/stream')).status()).toBe(401);
+    expect((await request.get('/api/agent/activity/stream?ticket=forged')).status()).toBe(401);
+    expect((await request.post('/api/agent/activity/ticket')).status()).toBe(401);
+    expect(
+      (await request.post('/api/agent/activity/ticket', { headers: { Authorization: 'Bearer wrong-key' } })).status()
+    ).toBe(401);
+  });
+
+  test('opens the activity stream with a single-use ticket', async ({ request }) => {
+    const issued = await request.post('/api/agent/activity/ticket', { headers: mcpHeaders });
+    expect(issued.status()).toBe(200);
+    const { ticket } = await issued.json();
+
+    const controller = new AbortController();
+    const first = await fetch(`${baseUrl}/api/agent/activity/stream?ticket=${ticket}`, { signal: controller.signal });
+    expect(first.status).toBe(200);
+    await first.body!.getReader().cancel();
+    controller.abort();
+
+    const replay = await request.get(`/api/agent/activity/stream?ticket=${ticket}`);
+    expect(replay.status()).toBe(401);
+  });
+
   test('streams MCP agent activity to the browser telemetry channel', async ({ request }) => {
     const controller = new AbortController();
     const response = await fetch(`${baseUrl}/api/agent/activity/stream`, {
+      headers: mcpHeaders,
       signal: controller.signal,
     });
     expect(response.status).toBe(200);

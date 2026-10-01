@@ -13,6 +13,8 @@ import { runBacktest, assertThresholds } from '../lib/backtest.ts';
 import { openapiSpec } from '../openapi/openapiSpec.ts';
 import { Modality } from '@google/genai';
 
+import { getDbFallbackStats } from '../db/index.ts';
+
 export const systemRouter = Router();
 
 // Lightweight Health & Load-Testing Probes
@@ -20,6 +22,7 @@ systemRouter.get('/health', (_req: Request, res: Response) => {
   const mem = process.memoryUsage();
   res.json({
     status: 'healthy',
+    database: getDbFallbackStats(),
     uptimeSeconds: Math.floor(process.uptime()),
     timestamp: Date.now(),
     memory: {

@@ -1,4 +1,4 @@
-import { db } from './index.ts';
+import { db, reportDbFallback } from './index.ts';
 import { notes, users } from './schema.ts';
 import { eq, desc, sql } from 'drizzle-orm';
 import { ai } from '../lib/ai.ts';
@@ -372,7 +372,7 @@ export async function getOrCreateUserRecord(uid: string, email: string) {
     const inserted = await db.insert(users).values({ uid, email }).returning();
     return inserted[0];
   } catch (error) {
-    // In-memory fallback
+    reportDbFallback('getOrCreateUserRecord', error);
     if (!inMemoryUsers.has(uid)) {
       inMemoryUsers.set(uid, { id: inMemoryUsers.size + 1, uid, email });
     }
@@ -398,7 +398,7 @@ export async function getUserNotes(userUid: string): Promise<NoteItem[]> {
       .orderBy(desc(notes.createdAt));
     if (results && results.length > 0) return results;
   } catch (error) {
-    // Fall back to in-memory store
+    reportDbFallback('getUserNotes', error);
   }
 
   // Return in-memory notes for userUid
@@ -444,8 +444,6 @@ export async function insertNoteWithEmbedding(
     createdAt: now,
     updatedAt: now,
   };
-  inMemoryNotes.set(newId, memoryNote);
-
   try {
     const vectorStr = `[${embedding.join(',')}]`;
     const result = await db.execute(
@@ -457,7 +455,9 @@ export async function insertNoteWithEmbedding(
       return result.rows[0];
     }
   } catch (error) {
-    // Return memory record if db unavailable
+    // DB unavailable: keep the note in memory so it is not lost while degraded
+    reportDbFallback('insertNoteWithEmbedding', error);
+    inMemoryNotes.set(newId, memoryNote);
   }
 
   return {
@@ -478,6 +478,7 @@ export async function deleteNote(id: number, userUid: string) {
     await db.delete(notes).where(sql`${notes.id} = ${id} AND ${notes.userUid} = ${userUid}`);
     return true;
   } catch (error) {
+    reportDbFallback('deleteNote', error);
     return true;
   }
 }
@@ -539,7 +540,7 @@ export async function searchNotesSemantic(
         .filter((item: { similarity: number }) => item.similarity >= minSimilarity);
     }
   } catch (error) {
-    // In-memory fallback
+    reportDbFallback('searchNotesSemantic', error);
   }
 
   // Calculate similarity in memory

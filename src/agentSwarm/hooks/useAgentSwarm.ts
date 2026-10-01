@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { AgentNode, AgentTask, AgenticMemoryEntry, M2MApiKey } from '../entities/agent';
 import { SwarmState, SwarmExecutionLog } from '../entities/swarm';
+import { auth } from '../../lib/firebase';
 
 const INITIAL_AGENTS: AgentNode[] = [
   {
@@ -199,7 +200,25 @@ export function useAgentSwarm() {
   }, []);
 
   useEffect(() => {
-    const stream = new EventSource('/api/agent/activity/stream');
+    let stream: EventSource | null = null;
+    let cancelled = false;
+    // The stream requires auth: exchange the signed-in user's Firebase ID token for a one-time ticket.
+    const connect = async () => {
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (!token) return;
+        const res = await fetch('/api/agent/activity/ticket', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok || cancelled) return;
+        const { ticket } = (await res.json()) as { ticket: string };
+        stream = new EventSource(`/api/agent/activity/stream?ticket=${encodeURIComponent(ticket)}`);
+        stream.addEventListener('agent_activity', handleActivity);
+      } catch {
+        // telemetry is best-effort; the swarm view still works without the live stream
+      }
+    };
     const handleActivity = (event: Event) => {
       try {
         const activity = JSON.parse((event as MessageEvent<string>).data) as {
@@ -230,14 +249,15 @@ export function useAgentSwarm() {
           status: activity.status,
         });
       } catch {
-        stream.close();
+        stream?.close();
       }
     };
 
-    stream.addEventListener('agent_activity', handleActivity);
+    void connect();
     return () => {
-      stream.removeEventListener('agent_activity', handleActivity);
-      stream.close();
+      cancelled = true;
+      stream?.removeEventListener('agent_activity', handleActivity);
+      stream?.close();
     };
   }, [addExecutionLog]);
 
