@@ -6,7 +6,7 @@ export interface AgentRequest extends Request {
   tenantId?: string;
 }
 
-export function requireAgentAuth(req: AgentRequest, res: Response, next: NextFunction) {
+export async function requireAgentAuth(req: AgentRequest, res: Response, next: NextFunction) {
   const configuredKey = process.env.SYMFLOWAGE_M2M_API_KEY || (process.env.NODE_ENV !== 'production' ? 'test-agent-key' : undefined);
   const authorization = req.header('authorization');
   const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
@@ -16,9 +16,16 @@ export function requireAgentAuth(req: AgentRequest, res: Response, next: NextFun
   }
 
   // 1. Metered per-tenant key (sk_live_...) - primary monetization path
-  const tenant = resolveTenantByRawKey(token);
+  let tenant;
+  try {
+    tenant = await resolveTenantByRawKey(token);
+  } catch (err) {
+    // Fail closed: if the key store is unreachable we cannot prove the key is valid or unrevoked.
+    console.error('[agentAuth] key store unavailable:', (err as Error)?.message || err);
+    return res.status(503).json({ error: 'auth_backend_unavailable' });
+  }
   if (tenant) {
-    const quota = checkQuota(tenant.id);
+    const quota = await checkQuota(tenant.id, tenant);
     if (!quota.allowed) {
       return res.status(402).json({
         error: 'quota_exceeded',
@@ -28,7 +35,7 @@ export function requireAgentAuth(req: AgentRequest, res: Response, next: NextFun
     }
     req.tenantId = tenant.id;
     req.agentId = req.header('x-agent-id') || 'anonymous-agent';
-    recordUsage(tenant.id, req.path || req.url);
+    await recordUsage(tenant.id, req.path || req.url);
     res.setHeader('X-Quota-Remaining', String(quota.summary.remaining));
     res.setHeader('X-Tenant-Plan', quota.summary.planId);
     return next();

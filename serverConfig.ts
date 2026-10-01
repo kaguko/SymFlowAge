@@ -50,7 +50,7 @@ function resolveGeminiApiKey(): string | undefined {
 
 export const serverConfig = {
   geminiApiKey: resolveGeminiApiKey(),
-  port: 3000,
+  port: Number(process.env.PORT) || 3000,
   appUrl: process.env.APP_URL || 'http://localhost:3000',
   isApiKeyConfigured: () => Boolean(resolveGeminiApiKey()),
 };

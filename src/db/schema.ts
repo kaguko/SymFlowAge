@@ -9,6 +9,9 @@ import {
   index,
   real,
   customType,
+  integer,
+  primaryKey,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
 
 // PostgreSQL pgvector 768-dimension column definition for text-embedding-004
@@ -153,6 +156,62 @@ export const outcomes = pgTable(
   (table) => ({
     evaluatedAtIdx: index('outcomes_evaluated_at_idx').on(table.evaluatedAt),
     predictionIdx: index('outcomes_prediction_idx').on(table.predictionId),
+  })
+);
+
+// ── Billing: tenants, API keys (hash only) and metered usage ──────────────────────────────
+export const tenants = pgTable(
+  'tenants',
+  {
+    id: text('id').primaryKey(),
+    email: text('email').notNull(),
+    name: text('name'),
+    planId: text('plan_id').notNull().default('free'),
+    status: text('status').notNull().default('active'),
+    stripeCustomerId: text('stripe_customer_id'),
+    stripeSubscriptionId: text('stripe_subscription_id'),
+    currentPeriodStart: timestamp('current_period_start', { withTimezone: true }).notNull().defaultNow(),
+    currentPeriodEnd: timestamp('current_period_end', { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    emailIdx: uniqueIndex('tenants_email_idx').on(table.email),
+    stripeCustomerIdx: index('tenants_stripe_customer_idx').on(table.stripeCustomerId),
+  })
+);
+
+export const apiKeys = pgTable(
+  'api_keys',
+  {
+    id: text('id').primaryKey(),
+    tenantId: text('tenant_id')
+      .references(() => tenants.id, { onDelete: 'cascade' })
+      .notNull(),
+    keyPrefix: text('key_prefix').notNull(),
+    keyHash: text('key_hash').notNull(),
+    name: text('name').notNull().default('default'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  },
+  (table) => ({
+    keyHashIdx: uniqueIndex('api_keys_key_hash_idx').on(table.keyHash),
+    tenantIdx: index('api_keys_tenant_idx').on(table.tenantId),
+  })
+);
+
+export const billingUsage = pgTable(
+  'billing_usage',
+  {
+    tenantId: text('tenant_id')
+      .references(() => tenants.id, { onDelete: 'cascade' })
+      .notNull(),
+    periodKey: text('period_key').notNull(),
+    route: text('route').notNull(),
+    count: integer('count').notNull().default(0),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.tenantId, table.periodKey, table.route] }),
   })
 );
 

@@ -5,12 +5,40 @@ import {
   getOrCreateTenant,
   getTenant,
   issueApiKey,
+  listApiKeys,
+  revokeApiKey,
+  resolveTenantByRawKey,
   getUsageSummary,
   updateTenantSubscription,
   findTenantByCustomerId,
 } from '../billing/billingStore.ts';
 
 export const billingRouter = Router();
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+function bearer(req: Request): string {
+  const h = req.header('authorization') || '';
+  return h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+}
+
+/** Resolve the tenant that owns the presented `sk_live_…` key (the key itself is the credential). */
+async function authTenant(req: Request, res: Response) {
+  const token = bearer(req);
+  if (!token) {
+    res.status(401).json({ error: 'invalid_agent_credentials' });
+    return undefined;
+  }
+  try {
+    const tenant = await resolveTenantByRawKey(token);
+    if (!tenant) res.status(401).json({ error: 'invalid_agent_credentials' });
+    return tenant;
+  } catch (err) {
+    console.error('[billing] key store unavailable:', (err as Error)?.message || err);
+    res.status(503).json({ error: 'auth_backend_unavailable' });
+    return undefined;
+  }
+}
 
 function getStripe(): Stripe | null {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -28,33 +56,59 @@ billingRouter.get('/plans', (_req: Request, res: Response) => {
 });
 
 // POST /api/billing/api-keys - issue a metered M2M key (BYOK-friendly)
-billingRouter.post('/api-keys', (req: Request, res: Response) => {
+billingRouter.post('/api-keys', async (req: Request, res: Response) => {
+ try {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
   if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email is required' });
   const name = typeof req.body?.name === 'string' ? req.body.name.slice(0, 60) : 'default';
-  const tenant = getOrCreateTenant(email);
-  const { rawKey, record } = issueApiKey(tenant.id, name);
+  const tenant = await getOrCreateTenant(email);
+  const { rawKey, record } = await issueApiKey(tenant.id, name);
   return res.status(201).json({
     tenantId: tenant.id,
     email: tenant.email,
     planId: tenant.planId,
     apiKey: rawKey,
     keyPrefix: record.keyPrefix,
-    usage: getUsageSummary(tenant.id),
+    usage: await getUsageSummary(tenant.id, tenant),
     mcpConfig: {
       url: `${process.env.APP_URL || 'http://localhost:3000'}/api/mcp/sse`,
       headers: { Authorization: `Bearer ${rawKey}` },
     },
   });
+ } catch (err: any) {
+  console.error('[billing/api-keys] failed:', err?.message || err);
+  return res.status(500).json({ error: 'api_key_issue_failed' });
+ }
+});
+
+// GET /api/billing/api-keys - list this tenant's keys (prefix/metadata only, never the secret)
+billingRouter.get('/api-keys', async (req: Request, res: Response) => {
+  const tenant = await authTenant(req, res);
+  if (!tenant) return;
+  return res.json({ tenantId: tenant.id, keys: await listApiKeys(tenant.id) });
+});
+
+// DELETE /api/billing/api-keys/:id - revoke one of this tenant's keys (takes effect immediately on this
+// instance; other instances within the 30s auth-cache TTL)
+billingRouter.delete('/api-keys/:id', async (req: Request, res: Response) => {
+  const tenant = await authTenant(req, res);
+  if (!tenant) return;
+  const revoked = await revokeApiKey(tenant.id, String(req.params.id));
+  return revoked ? res.json({ revoked: true }) : res.status(404).json({ error: 'key_not_found' });
 });
 
 // GET /api/billing/usage?tenantId=xxx
-billingRouter.get('/usage', (req: Request, res: Response) => {
-  const tenantId = String(req.query.tenantId || '');
-  if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
-  const t = getTenant(tenantId);
-  if (!t) return res.status(404).json({ error: 'tenant_not_found' });
-  return res.json(getUsageSummary(tenantId));
+billingRouter.get('/usage', async (req: Request, res: Response) => {
+  try {
+    const tenantId = String(req.query.tenantId || '');
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
+    const t = await getTenant(tenantId);
+    if (!t) return res.status(404).json({ error: 'tenant_not_found' });
+    return res.json(await getUsageSummary(tenantId, t));
+  } catch (err: any) {
+    console.error('[billing/usage] failed:', err?.message || err);
+    return res.status(500).json({ error: 'usage_failed' });
+  }
 });
 
 // POST /api/billing/checkout - create Stripe Checkout Session (or mock when no key)
@@ -66,14 +120,16 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email is required' });
     if (plan.id === 'free') return res.status(400).json({ error: 'free plan needs no checkout' });
 
-    const tenant = getOrCreateTenant(email);
+    const tenant = await getOrCreateTenant(email);
     const priceId = resolvePriceId(plan.id);
     const stripe = getStripe();
     const appUrl = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
 
     if (!stripe || !priceId) {
-      // Mock mode: no STRIPE_SECRET_KEY yet - return upgrade intent so frontend can proceed
-      updateTenantSubscription(tenant.id, { planId: plan.id, status: 'pending_checkout' });
+      // Mock mode: no STRIPE_SECRET_KEY yet - return upgrade intent so frontend can proceed.
+      // Never grant a paid plan without payment in production.
+      if (isProduction) return res.status(503).json({ error: 'billing_not_configured' });
+      await updateTenantSubscription(tenant.id, { planId: plan.id, status: 'pending_checkout' });
       return res.json({
         mode: 'mock',
         message: 'Set STRIPE_SECRET_KEY + STRIPE_PRICE_* to enable live checkout.',
@@ -91,7 +147,7 @@ billingRouter.post('/checkout', async (req: Request, res: Response) => {
       cancel_url: `${appUrl}/pricing?cancelled=1`,
       metadata: { tenantId: tenant.id, planId: plan.id },
     });
-    updateTenantSubscription(tenant.id, { planId: plan.id, status: 'pending_checkout' });
+    await updateTenantSubscription(tenant.id, { planId: plan.id, status: 'pending_checkout' });
     return res.json({ mode: 'live', tenantId: tenant.id, planId: plan.id, checkoutUrl: session.url });
   } catch (err: any) {
     console.error('[billing/checkout] failed:', err?.message || err);
@@ -110,7 +166,9 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
       // NOTE: requires express.raw for this route (mounted before express.json)
       event = stripe.webhooks.constructEvent((req as any).body, sig, webhookSecret);
     } else {
-      event = req.body; // mock/local testing path
+      // Unsigned events are a local-testing convenience only; in production anyone could forge a plan upgrade.
+      if (isProduction) return res.status(503).json({ error: 'billing_not_configured' });
+      event = req.body;
     }
 
     const type = (event as any)?.type || '';
@@ -120,7 +178,7 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
       const tenantId = obj?.metadata?.tenantId;
       const planId = obj?.metadata?.planId || 'pro';
       if (tenantId) {
-        updateTenantSubscription(tenantId, {
+        await updateTenantSubscription(tenantId, {
           planId,
           status: 'active',
           stripeCustomerId: obj?.customer || null,
@@ -131,9 +189,9 @@ billingRouter.post('/webhook', async (req: Request, res: Response) => {
     }
     if (type === 'customer.subscription.updated' || type === 'customer.subscription.deleted') {
       const customerId = obj?.customer;
-      const t = customerId ? findTenantByCustomerId(String(customerId)) : undefined;
+      const t = customerId ? await findTenantByCustomerId(String(customerId)) : undefined;
       if (t) {
-        updateTenantSubscription(t.id, {
+        await updateTenantSubscription(t.id, {
           status: type.includes('deleted') ? 'cancelled' : obj?.status || t.status,
           planId: type.includes('deleted') ? 'free' : t.planId,
         });

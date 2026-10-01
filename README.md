@@ -85,6 +85,7 @@ Mẫu kết quả với embedding thật (mục tiêu "Build a Node.js payment A
 
 ### Thay đổi mới nhất
 **Khóa bảo mật production**
+- Tenant, API key (chỉ lưu hash) và usage được lưu Postgres; thêm revoke/list key; server đọc biến `PORT`.
 - `requireAuth` không còn fallback guest ở production và không bao giờ hạ token sai thành guest.
 - `/api/agent/activity/stream` không còn mở: cần API key (agent/tenant) ở header hoặc ticket dùng một lần; ticket cấp qua `POST /api/agent/activity/ticket` bằng Firebase ID token (UI) hoặc API key.
 - Production không khởi động nếu thiếu `DATABASE_URL`/`SQL_HOST`; in-memory chỉ là chế độ suy giảm khi DB đã cấu hình bị lỗi (có log và đếm tại `/api/health`).
@@ -264,7 +265,9 @@ curl -X POST "$APP_URL/api/v1/agent/guardrail/drift-check" \
 - **Activity stream**: `GET /api/agent/activity/stream` trả `401` nếu không có credential hợp lệ. Cách vào: (1) header `Authorization: Bearer <API key>` (M2M hoặc `sk_live_…`), hoặc (2) `?ticket=` — ticket một lần, sống 30 giây, lấy bằng `POST /api/agent/activity/ticket` với Firebase ID token (verify nghiêm ngặt, không guest) hoặc API key. Browser dùng `EventSource` nên phải đổi ticket; secret dài hạn không xuất hiện trong URL. UI chỉ kết nối khi người dùng đã đăng nhập Firebase.
 - **Database**: khi `NODE_ENV=production` mà không có `DATABASE_URL`/`SQL_HOST`, server từ chối khởi động. Ngoại lệ tường minh: `SYMFLOWAGE_ALLOW_INMEMORY=1` (chỉ demo, dữ liệu mất khi restart, có log lỗi). Khi DB đã cấu hình nhưng lỗi lúc chạy, các store (`notes`, `users`) tạm dùng in-memory, ghi log `[DB FALLBACK]` và đếm ở `GET /api/health` → `database.fallbackEvents`.
 - **Auth người dùng (`requireAuth`, dùng cho `/api/notes`, `/api/predict`…)**: production trả `401` khi thiếu token; token sai/hết hạn luôn bị `401` ở mọi môi trường (không còn bị hạ xuống guest). Chế độ guest chỉ bật ở dev, hoặc ở production khi đặt `SYMFLOWAGE_ALLOW_GUEST=1` (demo công khai, mọi guest dùng chung một tài khoản).
-- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa được tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); tenant & API key billing đang lưu in-memory (mất khi restart, DB chỉ ghi best-effort); server chưa đọc biến `PORT`.
+- **Tenant / API key / usage lưu Postgres** (`tenants`, `api_keys`, `billing_usage`; migration `drizzle/0002_tenants_api_keys.sql`, tự áp dụng khi khởi động): restart/deploy không làm mất key hay quota. Key chỉ lưu dạng SHA-256 (key ngẫu nhiên ≥ 192 bit nên không cần bcrypt/argon2; không lưu bản mã hóa vì hệ thống không gọi dịch vụ thay khách); raw key chỉ hiện một lần lúc cấp. Có DB mà DB lỗi → xác thực **fail closed** (`503`), không rơi về memory. Không có DB (dev/test) → in-memory và log cảnh báo. Revoke: `DELETE /api/billing/api-keys/:id` (xác thực bằng key của chính tenant), liệt kê: `GET /api/billing/api-keys`; hiệu lực tức thì trên instance xử lý, tối đa 30 giây ở instance khác (cache xác thực). Bộ đếm usage ghi đệm và flush mỗi 5 giây + khi nhận SIGTERM; chạy nhiều instance thì quota chỉ xấp xỉ.
+- **Billing**: webhook không chữ ký và checkout "mock" (tự nâng gói không thanh toán) bị từ chối ở production (`503`). Các route `GET /api/v1/agent/{guardrail/exemptions,accuracy-score,circuit-breaker/config}` nay yêu cầu API key.
+- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); `POST /api/billing/api-keys` cấp key tự do theo email (không xác minh email, chưa rate limit riêng) và `GET /api/billing/usage?tenantId=` không cần xác thực.
 
 ---
 
@@ -305,6 +308,7 @@ Firebase Auth (tùy chọn): tạo `.env.local` (đã git-ignored) với `VITE_F
 | `SYMFLOWAGE_REQUIRE_SEMANTIC` | Không | `1` → drift-check trả `503` thay vì dùng embedding fallback |
 | `SYMFLOWAGE_CALIBRATION_MEMORY_PATH` | Không | Mặc định `.data/calibration-memory.json` |
 | `SYMFLOWAGE_WEBHOOK_URL` | Không | Webhook cho Circuit Breaker |
+| `PORT` | Không | Cổng HTTP (mặc định 3000) |
 | `APP_URL` | Không | URL triển khai |
 | `DATABASE_URL` / `SQL_HOST` | **Bắt buộc ở production** | PostgreSQL (pgvector); thiếu thì production không khởi động |
 | `SYMFLOWAGE_ALLOW_GUEST` | Không | `1` cho phép request không token chạy với tài khoản guest ở production (chỉ demo) |
@@ -325,6 +329,8 @@ npx playwright install chromium && npx playwright install-deps chromium   # nế
 ```
 
 Load test: `npm run test:load:k6-spike`, `test:load:k6-rampup`, `test:load:autocannon`, `test:load:heavy-agent`.
+
+Test persistence tenant/API key cần Postgres thật: `TEST_DATABASE_URL=postgresql://user:pw@127.0.0.1:5432/db npx playwright test tests/billing-persistence.spec.ts` (tự bỏ qua nếu thiếu biến).
 
 Test fallback không tốn quota:
 

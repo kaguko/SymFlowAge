@@ -7,6 +7,9 @@ import { mountMcpRoutes } from './src/mcp/mcpServer.ts';
 import { heavyAgentRouter } from './src/agentSwarm/heavyAgent/heavyAgentRoutes.ts';
 import { globalAgentWebSocketServer } from './src/agentSwarm/heavyAgent/websocketAgentStream.ts';
 import { openapiSpec } from './src/openapi/openapiSpec.ts';
+import { isDbConfigured } from './src/db/index.ts';
+import { ensureBillingSchema } from './src/billing/billingSchema.ts';
+import { flushBillingUsage } from './src/billing/billingStore.ts';
 
 // Modular Route Imports
 import { agentRouter, handleRecordOutcome, handleGetAccuracyScore, handleGetCircuitBreakerConfig, handleUpdateCircuitBreakerConfig } from './src/routes/agentRoutes.ts';
@@ -82,6 +85,23 @@ async function setupVite() {
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`SymFlowAge server running at http://localhost:${PORT}`);
+  });
+}
+
+if (isDbConfigured) {
+  ensureBillingSchema().catch((err) =>
+    console.error('[billing] could not prepare tenant tables; key-authenticated requests will return 503:', err?.message || err)
+  );
+}
+
+// Persist buffered usage counters before the process exits. A persistent listener (not `once`) so a
+// repeated signal (e.g. relayed by a process supervisor) cannot kill the process mid-flush.
+let shuttingDown = false;
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    flushBillingUsage().finally(() => process.exit(0));
   });
 }
 
