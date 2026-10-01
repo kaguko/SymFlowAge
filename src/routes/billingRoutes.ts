@@ -3,38 +3,38 @@ import Stripe from 'stripe';
 import { BILLING_PLANS, getPlan, resolvePriceId } from '../billing/plans.ts';
 import {
   getOrCreateTenant,
+  createTenantIfAbsent,
   getTenant,
   issueApiKey,
   listApiKeys,
   revokeApiKey,
-  resolveTenantByRawKey,
   getUsageSummary,
   updateTenantSubscription,
   findTenantByCustomerId,
 } from '../billing/billingStore.ts';
+import { resolveBillingPrincipal, tenantForPrincipal } from '../billing/billingAuth.ts';
 
 export const billingRouter = Router();
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-function bearer(req: Request): string {
-  const h = req.header('authorization') || '';
-  return h.startsWith('Bearer ') ? h.slice(7).trim() : '';
-}
+// Self-serve signup without credentials is a dev/demo convenience only. In production it needs an
+// explicit opt-in, because anyone could otherwise register (or squat) any email address.
+const openSignupAllowed = () => !isProduction || process.env.SYMFLOWAGE_ALLOW_OPEN_SIGNUP === '1';
 
-/** Resolve the tenant that owns the presented `sk_live_…` key (the key itself is the credential). */
+/** Resolve the tenant for the caller (tenant API key, or verified Firebase email). Sends the error response itself. */
 async function authTenant(req: Request, res: Response) {
-  const token = bearer(req);
-  if (!token) {
-    res.status(401).json({ error: 'invalid_agent_credentials' });
-    return undefined;
-  }
   try {
-    const tenant = await resolveTenantByRawKey(token);
-    if (!tenant) res.status(401).json({ error: 'invalid_agent_credentials' });
+    const principal = await resolveBillingPrincipal(req);
+    if (principal.kind === 'none' || principal.kind === 'invalid') {
+      res.status(401).json({ error: 'invalid_agent_credentials' });
+      return undefined;
+    }
+    const tenant = await tenantForPrincipal(principal);
+    if (!tenant) res.status(404).json({ error: 'tenant_not_found' });
     return tenant;
   } catch (err) {
-    console.error('[billing] key store unavailable:', (err as Error)?.message || err);
+    console.error('[billing] auth backend unavailable:', (err as Error)?.message || err);
     res.status(503).json({ error: 'auth_backend_unavailable' });
     return undefined;
   }
@@ -57,28 +57,54 @@ billingRouter.get('/plans', (_req: Request, res: Response) => {
 
 // POST /api/billing/api-keys - issue a metered M2M key (BYOK-friendly)
 billingRouter.post('/api-keys', async (req: Request, res: Response) => {
- try {
-  const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
-  if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email is required' });
-  const name = typeof req.body?.name === 'string' ? req.body.name.slice(0, 60) : 'default';
-  const tenant = await getOrCreateTenant(email);
-  const { rawKey, record } = await issueApiKey(tenant.id, name);
-  return res.status(201).json({
-    tenantId: tenant.id,
-    email: tenant.email,
-    planId: tenant.planId,
-    apiKey: rawKey,
-    keyPrefix: record.keyPrefix,
-    usage: await getUsageSummary(tenant.id, tenant),
-    mcpConfig: {
-      url: `${process.env.APP_URL || 'http://localhost:3000'}/api/mcp/sse`,
-      headers: { Authorization: `Bearer ${rawKey}` },
-    },
-  });
- } catch (err: any) {
-  console.error('[billing/api-keys] failed:', err?.message || err);
-  return res.status(500).json({ error: 'api_key_issue_failed' });
- }
+  try {
+    const name = typeof req.body?.name === 'string' ? req.body.name.slice(0, 60) : 'default';
+    const principal = await resolveBillingPrincipal(req);
+
+    let tenant;
+    if (principal.kind === 'invalid') {
+      return res.status(401).json({ error: 'invalid_agent_credentials' });
+    } else if (principal.kind === 'key') {
+      tenant = principal.tenant; // key rotation / extra key for the caller's own tenant
+    } else if (principal.kind === 'firebase') {
+      tenant = await getOrCreateTenant(principal.email); // identity comes from the verified token, never the body
+    } else {
+      if (!openSignupAllowed()) {
+        return res.status(401).json({
+          error: 'authentication_required',
+          message: 'Sign in (Firebase ID token) or present an existing tenant API key to create a key.',
+        });
+      }
+      const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email is required' });
+      const created = await createTenantIfAbsent(email);
+      if (!created.created) {
+        // Never mint a key for an existing tenant from an unauthenticated request.
+        return res.status(409).json({
+          error: 'tenant_exists',
+          message: 'This email already has a tenant. Authenticate with an existing key to create another.',
+        });
+      }
+      tenant = created.tenant;
+    }
+
+    const { rawKey, record } = await issueApiKey(tenant.id, name);
+    return res.status(201).json({
+      tenantId: tenant.id,
+      email: tenant.email,
+      planId: tenant.planId,
+      apiKey: rawKey,
+      keyPrefix: record.keyPrefix,
+      usage: await getUsageSummary(tenant.id, tenant),
+      mcpConfig: {
+        url: `${process.env.APP_URL || 'http://localhost:3000'}/api/mcp/sse`,
+        headers: { Authorization: `Bearer ${rawKey}` },
+      },
+    });
+  } catch (err: any) {
+    console.error('[billing/api-keys] failed:', err?.message || err);
+    return res.status(500).json({ error: 'api_key_issue_failed' });
+  }
 });
 
 // GET /api/billing/api-keys - list this tenant's keys (prefix/metadata only, never the secret)
@@ -97,14 +123,14 @@ billingRouter.delete('/api-keys/:id', async (req: Request, res: Response) => {
   return revoked ? res.json({ revoked: true }) : res.status(404).json({ error: 'key_not_found' });
 });
 
-// GET /api/billing/usage?tenantId=xxx
+// GET /api/billing/usage[?tenantId=xxx] - caller's own tenant only (tenant API key or verified Firebase user)
 billingRouter.get('/usage', async (req: Request, res: Response) => {
   try {
-    const tenantId = String(req.query.tenantId || '');
-    if (!tenantId) return res.status(400).json({ error: 'tenantId is required' });
-    const t = await getTenant(tenantId);
-    if (!t) return res.status(404).json({ error: 'tenant_not_found' });
-    return res.json(await getUsageSummary(tenantId, t));
+    const tenant = await authTenant(req, res);
+    if (!tenant) return;
+    const requested = req.query.tenantId === undefined ? tenant.id : String(req.query.tenantId);
+    if (requested !== tenant.id) return res.status(403).json({ error: 'forbidden_tenant' });
+    return res.json(await getUsageSummary(tenant.id, tenant));
   } catch (err: any) {
     console.error('[billing/usage] failed:', err?.message || err);
     return res.status(500).json({ error: 'usage_failed' });

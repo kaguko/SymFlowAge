@@ -6,6 +6,9 @@ export interface AgentRequest extends Request {
   tenantId?: string;
 }
 
+/** Isolation scope for events/alerts: a tenant's own key sees only that tenant's traffic; the legacy shared key sees the legacy pool. */
+export const agentScope = (req: { tenantId?: string }) => (req.tenantId ? `tenant:${req.tenantId}` : 'legacy');
+
 export async function requireAgentAuth(req: AgentRequest, res: Response, next: NextFunction) {
   const configuredKey = process.env.SYMFLOWAGE_M2M_API_KEY || (process.env.NODE_ENV !== 'production' ? 'test-agent-key' : undefined);
   const authorization = req.header('authorization');

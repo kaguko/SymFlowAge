@@ -78,14 +78,23 @@ test.describe('Tenant / API key persistence (Postgres)', () => {
     const authed = await fetch(`${base}/api/v1/agent/guardrail/exemptions`, { headers: { Authorization: `Bearer ${apiKey}` } });
     expect(authed.status).toBe(200);
 
-    const usage = await (await fetch(`${base}/api/billing/usage?tenantId=${tenantId}`)).json();
+    const usage = await (await fetch(`${base}/api/billing/usage?tenantId=${tenantId}`, { headers: { Authorization: `Bearer ${apiKey}` } })).json();
     expect(usage.tenantId).toBe(tenantId);
     expect(usage.used).toBeGreaterThanOrEqual(2);
 
-    const again = await (await fetch(`${base}/api/billing/api-keys`, {
+    // Unauthenticated signup must not mint a key for an existing tenant...
+    const hijack = await fetch(`${base}/api/billing/api-keys`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }),
-    })).json();
-    expect(again.tenantId).toBe(tenantId); // same tenant, not a new one
+    });
+    expect(hijack.status).toBe(409);
+    expect(JSON.stringify(await hijack.json())).not.toContain('sk_live_');
+
+    // ...but the tenant itself (authenticated) can add another key, under the same tenant.
+    const again = await fetch(`${base}/api/billing/api-keys`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ name: 'second' }),
+    });
+    expect(again.status).toBe(201);
+    expect((await again.json()).tenantId).toBe(tenantId);
   });
 
   test('a revoked key returns 401, immediately and after restart', async () => {
@@ -118,3 +127,75 @@ test.describe('Tenant / API key persistence (Postgres)', () => {
     expect(stillWorks.status).toBe(200);
   });
 });
+
+test.describe('Billing access control (production mode)', () => {
+  test.skip(!dbUrl, 'TEST_DATABASE_URL not set');
+  test.describe.configure({ mode: 'serial' });
+
+  const PROD_PORT = 3108;
+  const prod = `http://127.0.0.1:${PROD_PORT}`;
+  let devServer: ChildProcess;
+  let prodServer: ChildProcess;
+  let a: { apiKey: string; tenantId: string };
+  let b: { apiKey: string; tenantId: string };
+
+  async function waitUp(url: string) {
+    for (let i = 0; i < 120; i++) {
+      try { if ((await fetch(`${url}/api/health`)).ok) return; } catch { /* not yet */ }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`server at ${url} did not start`);
+  }
+
+  test.beforeAll(async () => {
+    // A dev-mode server (open signup) only to mint two tenants; the production server is what is under test.
+    devServer = await startServer();
+    const mk = async (email: string) => (await fetch(`${base}/api/billing/api-keys`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }),
+    })).json();
+    a = await mk(`prod-a-${Date.now()}@example.com`);
+    b = await mk(`prod-b-${Date.now()}@example.com`);
+    prodServer = spawn('npx', ['tsx', 'server.ts'], {
+      env: { ...process.env, PORT: String(PROD_PORT), DATABASE_URL: dbUrl!, NODE_ENV: 'production', SYMFLOWAGE_M2M_API_KEY: 'prod-legacy-key', GEMINI_API_KEY: '' },
+      stdio: 'ignore', detached: true,
+    });
+    await waitUp(prod);
+  });
+  test.afterAll(async () => {
+    for (const c of [prodServer, devServer]) { try { process.kill(-c.pid!, 'SIGTERM'); } catch { /* gone */ } }
+    await new Promise((r) => setTimeout(r, 1500));
+  });
+
+  const json = { 'Content-Type': 'application/json' };
+
+  test('POST /api/billing/api-keys needs real credentials in production', async () => {
+    const anon = await fetch(`${prod}/api/billing/api-keys`, { method: 'POST', headers: json, body: JSON.stringify({ email: 'victim@example.com' }) });
+    expect(anon.status).toBe(401);
+    const forged = await fetch(`${prod}/api/billing/api-keys`, { method: 'POST', headers: { ...json, Authorization: 'Bearer aaa.bbb.ccc' }, body: JSON.stringify({ email: 'victim@example.com' }) });
+    expect(forged.status).toBe(401);
+    const bad = await fetch(`${prod}/api/billing/api-keys`, { method: 'POST', headers: { ...json, Authorization: 'Bearer sk_live_doesnotexist' }, body: '{}' });
+    expect(bad.status).toBe(401);
+  });
+
+  test('an existing tenant key can still rotate/add keys in production, for its own tenant only', async () => {
+    const res = await fetch(`${prod}/api/billing/api-keys`, { method: 'POST', headers: { ...json, Authorization: `Bearer ${a.apiKey}` }, body: JSON.stringify({ email: 'ignored@example.com', name: 'rot' }) });
+    expect(res.status).toBe(201);
+    expect((await res.json()).tenantId).toBe(a.tenantId); // body email is ignored
+  });
+
+  test('GET /api/billing/usage requires auth and is limited to the caller tenant', async () => {
+    expect((await fetch(`${prod}/api/billing/usage?tenantId=${a.tenantId}`)).status).toBe(401);
+    expect((await fetch(`${prod}/api/billing/usage?tenantId=${a.tenantId}`, { headers: { Authorization: 'Bearer nope' } })).status).toBe(401);
+
+    const own = await fetch(`${prod}/api/billing/usage?tenantId=${a.tenantId}`, { headers: { Authorization: `Bearer ${a.apiKey}` } });
+    expect(own.status).toBe(200);
+    expect((await own.json()).tenantId).toBe(a.tenantId);
+
+    const implicit = await fetch(`${prod}/api/billing/usage`, { headers: { Authorization: `Bearer ${a.apiKey}` } });
+    expect((await implicit.json()).tenantId).toBe(a.tenantId);
+
+    const other = await fetch(`${prod}/api/billing/usage?tenantId=${b.tenantId}`, { headers: { Authorization: `Bearer ${a.apiKey}` } });
+    expect(other.status).toBe(403);
+  });
+});
+

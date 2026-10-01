@@ -105,30 +105,45 @@ function invalidateAuthCache(match?: { keyId?: string; tenantId?: string }) {
 }
 
 // ── Tenants ────────────────────────────────────────────────────────────────────────────────
-export async function getOrCreateTenant(email: string): Promise<TenantRecord> {
+/** Atomically create a tenant for `email`, or return the existing one (`created: false`). */
+export async function createTenantIfAbsent(email: string): Promise<{ tenant: TenantRecord; created: boolean }> {
   const norm = email.trim().toLowerCase();
   const { start, end } = currentPeriod();
   const id = `tnt_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   if (!useDb) {
     const existing = memTenants.get(memTenantsByEmail.get(norm) || '');
-    if (existing) return existing;
+    if (existing) return { tenant: existing, created: false };
     const t: TenantRecord = {
       id, email: norm, planId: 'free', status: 'active',
       currentPeriodStart: start, currentPeriodEnd: end, createdAt: new Date(),
     };
     memTenants.set(id, t);
     memTenantsByEmail.set(norm, id);
-    return t;
+    return { tenant: t, created: true };
   }
 
   await ready();
-  await db
+  const inserted = await db
     .insert(tenantsTable)
     .values({ id, email: norm, currentPeriodStart: start, currentPeriodEnd: end })
-    .onConflictDoNothing({ target: tenantsTable.email });
+    .onConflictDoNothing({ target: tenantsTable.email })
+    .returning();
+  if (inserted.length > 0) return { tenant: toTenant(inserted[0]), created: true };
   const [row] = await db.select().from(tenantsTable).where(eq(tenantsTable.email, norm)).limit(1);
-  return toTenant(row);
+  return { tenant: toTenant(row), created: false };
+}
+
+export async function getOrCreateTenant(email: string): Promise<TenantRecord> {
+  return (await createTenantIfAbsent(email)).tenant;
+}
+
+export async function findTenantByEmail(email: string): Promise<TenantRecord | undefined> {
+  const norm = email.trim().toLowerCase();
+  if (!useDb) return memTenants.get(memTenantsByEmail.get(norm) || '');
+  await ready();
+  const [row] = await db.select().from(tenantsTable).where(eq(tenantsTable.email, norm)).limit(1);
+  return row ? toTenant(row) : undefined;
 }
 
 export async function getTenant(id: string): Promise<TenantRecord | undefined> {

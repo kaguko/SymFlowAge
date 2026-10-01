@@ -85,6 +85,7 @@ Mẫu kết quả với embedding thật (mục tiêu "Build a Node.js payment A
 
 ### Thay đổi mới nhất
 **Khóa bảo mật production**
+- Cấp key/xem usage yêu cầu xác thực; activity stream và alert circuit breaker được cô lập theo tenant.
 - Tenant, API key (chỉ lưu hash) và usage được lưu Postgres; thêm revoke/list key; server đọc biến `PORT`.
 - `requireAuth` không còn fallback guest ở production và không bao giờ hạ token sai thành guest.
 - `/api/agent/activity/stream` không còn mở: cần API key (agent/tenant) ở header hoặc ticket dùng một lần; ticket cấp qua `POST /api/agent/activity/ticket` bằng Firebase ID token (UI) hoặc API key.
@@ -267,7 +268,13 @@ curl -X POST "$APP_URL/api/v1/agent/guardrail/drift-check" \
 - **Auth người dùng (`requireAuth`, dùng cho `/api/notes`, `/api/predict`…)**: production trả `401` khi thiếu token; token sai/hết hạn luôn bị `401` ở mọi môi trường (không còn bị hạ xuống guest). Chế độ guest chỉ bật ở dev, hoặc ở production khi đặt `SYMFLOWAGE_ALLOW_GUEST=1` (demo công khai, mọi guest dùng chung một tài khoản).
 - **Tenant / API key / usage lưu Postgres** (`tenants`, `api_keys`, `billing_usage`; migration `drizzle/0002_tenants_api_keys.sql`, tự áp dụng khi khởi động): restart/deploy không làm mất key hay quota. Key chỉ lưu dạng SHA-256 (key ngẫu nhiên ≥ 192 bit nên không cần bcrypt/argon2; không lưu bản mã hóa vì hệ thống không gọi dịch vụ thay khách); raw key chỉ hiện một lần lúc cấp. Có DB mà DB lỗi → xác thực **fail closed** (`503`), không rơi về memory. Không có DB (dev/test) → in-memory và log cảnh báo. Revoke: `DELETE /api/billing/api-keys/:id` (xác thực bằng key của chính tenant), liệt kê: `GET /api/billing/api-keys`; hiệu lực tức thì trên instance xử lý, tối đa 30 giây ở instance khác (cache xác thực). Bộ đếm usage ghi đệm và flush mỗi 5 giây + khi nhận SIGTERM; chạy nhiều instance thì quota chỉ xấp xỉ.
 - **Billing**: webhook không chữ ký và checkout "mock" (tự nâng gói không thanh toán) bị từ chối ở production (`503`). Các route `GET /api/v1/agent/{guardrail/exemptions,accuracy-score,circuit-breaker/config}` nay yêu cầu API key.
-- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); `POST /api/billing/api-keys` cấp key tự do theo email (không xác minh email, chưa rate limit riêng) và `GET /api/billing/usage?tenantId=` không cần xác thực.
+- **Cấp key & xem usage**: `POST /api/billing/api-keys` ở production chỉ chấp nhận (a) tenant API key hiện có (cấp thêm key cho chính tenant đó; `email` trong body bị bỏ qua) hoặc (b) Firebase ID token có `email_verified` (tenant lấy từ email trong token). Không credential → `401`. Đăng ký tự do không credential chỉ bật ở dev, hoặc production khi `SYMFLOWAGE_ALLOW_OPEN_SIGNUP=1`; ngay cả khi đó email đã có tenant trả `409`, không bao giờ cấp key cho tenant có sẵn. `GET /api/billing/usage` luôn cần xác thực và chỉ trả usage của tenant mình (`tenantId` của tenant khác → `403`).
+- **Cô lập theo tenant**: sự kiện activity stream và cảnh báo circuit breaker trên MCP SSE gắn `scope` (`tenant:<id>` hoặc `legacy` cho khóa `SYMFLOWAGE_M2M_API_KEY` dùng chung). Subscriber chỉ nhận sự kiện cùng scope; ticket stream gắn với tenant của người xin ticket; user Firebase chưa có tenant không nhận sự kiện nào. Bộ đếm lỗi liên tiếp của circuit breaker cũng tách theo scope (`x-agent-id` do client tự chọn nên không đáng tin để làm khóa chung).
+- **Giới hạn đã biết**:
+  - Cache xác thực 30 giây: revoke key hoặc đổi gói thực hiện trên instance khác có thể trễ tối đa 30 giây; chạy nhiều instance thì quota chỉ xấp xỉ.
+  - Cấu hình circuit breaker (`/circuit-breaker/config`) vẫn dùng chung toàn hệ thống: bất kỳ API key hợp lệ nào cũng sửa được ngưỡng và webhook của mọi tenant.
+  - `POST /api/billing/checkout` vẫn nhận `email` từ body mà không xác thực người gọi.
+  - Luồng Firebase của `POST /api/billing/api-keys` và ticket stream chưa có test tự động (cần token Firebase thật); các nhánh từ chối và nhánh dùng tenant key đã có test.
 
 ---
 
@@ -311,6 +318,7 @@ Firebase Auth (tùy chọn): tạo `.env.local` (đã git-ignored) với `VITE_F
 | `PORT` | Không | Cổng HTTP (mặc định 3000) |
 | `APP_URL` | Không | URL triển khai |
 | `DATABASE_URL` / `SQL_HOST` | **Bắt buộc ở production** | PostgreSQL (pgvector); thiếu thì production không khởi động |
+| `SYMFLOWAGE_ALLOW_OPEN_SIGNUP` | Không | `1` cho phép production cấp key cho email mới không cần credential (chỉ demo) |
 | `SYMFLOWAGE_ALLOW_GUEST` | Không | `1` cho phép request không token chạy với tài khoản guest ở production (chỉ demo) |
 | `SYMFLOWAGE_ALLOW_INMEMORY` | Không | `1` cho phép production chạy không DB (chỉ demo) |
 | `VITE_FIREBASE_*` | Không | `API_KEY`, `PROJECT_ID`, `AUTH_DOMAIN`, `STORAGE_BUCKET`, `MESSAGING_SENDER_ID`, `APP_ID`, `MEASUREMENT_ID` |
@@ -337,6 +345,8 @@ Test fallback không tốn quota:
 ```bash
 env -u GEMINI_API_KEY -u VITE_GEMINI_API_KEY SYMFLOWAGE_M2M_API_KEY=test-agent-key npx playwright test tests/fallback.spec.ts
 ```
+
+Spec `stream-isolation` kiểm tra hai tenant không thấy sự kiện của nhau. Test `mcp-sse › HALT_EXECUTION` cần `GEMINI_API_KEY`: câu "tự viết lại UI framework" là diễn đạt lại nên chỉ embedding thật mới bắt được, bản fallback từ khóa trả `ALLOW` (đây là giới hạn đã biết, không phải lỗi môi trường).
 
 Các spec chính: `agent-api`, `mcp-sse`, `heavy-agent`, `ui-smoke`, `fallback`, `calibration-memory`, `drift-false-positive-and-cache`, `drift-score-golden`, `rabbit-hole-detector`. Khi có `GEMINI_API_KEY`, guardrail chạy bằng embedding thật; không có key, các test chạy bằng embedding fallback. Spec `rabbit-hole-detector` cần browser Chromium của Playwright. Báo cáo hiệu năng: [`BENCHMARKS.md`](./BENCHMARKS.md) (ARQ 35.420+ QPS, cache < 1.1ms P95, giảm 88,4% chi phí token).
 

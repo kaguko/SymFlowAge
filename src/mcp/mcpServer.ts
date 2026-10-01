@@ -22,7 +22,7 @@ import {
   updateCircuitBreakerConfig,
   registerSseAlertSubscriber,
 } from '../lib/circuitBreaker.ts';
-import { requireAgentAuth } from '../middleware/agentAuth.ts';
+import { requireAgentAuth, agentScope } from '../middleware/agentAuth.ts';
 import { issueStreamTicket, requireStreamAuth } from '../middleware/streamAuth.ts';
 import { addCalibrationRule, getActiveCalibrationRules } from '../lib/calibrationMemory.ts';
 import { serverDriftFeedbackStore, getDriftCalibrationStats } from '../routes/driftFeedbackStore.ts';
@@ -54,7 +54,7 @@ function cleanJsonResponse(text: string): string {
   return cleaned.trim();
 }
 
-export function createSymFlowAgeMcpServer() {
+export function createSymFlowAgeMcpServer(scope = 'legacy') {
   const server = new Server(
     {
       name: 'symflowage-mcp-server',
@@ -329,6 +329,7 @@ export function createSymFlowAgeMcpServer() {
     const { name, arguments: args = {} } = request.params;
     let activityStatus: AgentActivityEvent['status'] = 'success';
     publishAgentActivity({
+      scope,
       id: `activity_${randomUUID().slice(0, 8)}`,
       timestamp: new Date().toISOString(),
       agentId: String(args.agentId || 'mcp-agent'),
@@ -973,6 +974,7 @@ Bắt buộc trả về đúng JSON:
       };
     } finally {
       publishAgentActivity({
+        scope,
         id: `activity_${randomUUID().slice(0, 8)}`,
         timestamp: new Date().toISOString(),
         agentId: String(args.agentId || 'mcp-agent'),
@@ -990,6 +992,8 @@ Bắt buộc trả về đúng JSON:
 }
 
 export interface AgentActivityEvent {
+  /** Isolation scope: `tenant:<id>` or `legacy` (see agentScope). Only subscribers of the same scope receive it. */
+  scope?: string;
   id: string;
   timestamp: string;
   agentId: string;
@@ -1000,15 +1004,19 @@ export interface AgentActivityEvent {
   driftScore?: number;
 }
 
-const activitySubscribers = new Set<(event: AgentActivityEvent) => void>();
+const activitySubscribers = new Set<{ callback: (event: AgentActivityEvent) => void; scope: string }>();
 
-export function registerAgentActivitySubscriber(callback: (event: AgentActivityEvent) => void) {
-  activitySubscribers.add(callback);
-  return () => activitySubscribers.delete(callback);
+export function registerAgentActivitySubscriber(callback: (event: AgentActivityEvent) => void, scope = 'legacy') {
+  const entry = { callback, scope };
+  activitySubscribers.add(entry);
+  return () => activitySubscribers.delete(entry);
 }
 
 function publishAgentActivity(event: AgentActivityEvent) {
-  for (const subscriber of activitySubscribers) subscriber(event);
+  const scope = event.scope || 'legacy';
+  for (const subscriber of activitySubscribers) {
+    if (subscriber.scope === scope) subscriber.callback(event);
+  }
 }
 
 // Active SSE Transports Map
@@ -1020,7 +1028,8 @@ const sseTransports = new Map<string, SSEServerTransport>();
 export function mountMcpRoutes(app: any) {
   app.post('/api/agent/activity/ticket', issueStreamTicket);
 
-  app.get('/api/agent/activity/stream', requireStreamAuth, (_req: any, res: any) => {
+  app.get('/api/agent/activity/stream', requireStreamAuth, (req: any, res: any) => {
+    const scope: string = req.streamScope || 'legacy';
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -1029,7 +1038,7 @@ export function mountMcpRoutes(app: any) {
     const writeEvent = (event: AgentActivityEvent) => {
       res.write(`event: agent_activity\ndata: ${JSON.stringify(event)}\n\n`);
     };
-    const unregister = registerAgentActivitySubscriber(writeEvent);
+    const unregister = registerAgentActivitySubscriber(writeEvent, scope);
     const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
     writeEvent({
       id: `activity_${randomUUID().slice(0, 8)}`,
@@ -1051,7 +1060,7 @@ export function mountMcpRoutes(app: any) {
   // For lightweight HTTP JSON-RPC tools invocation by Cursor / Windsurf / Custom Agents
   app.post('/api/mcp', requireAgentAuth, async (req: any, res: any) => {
     try {
-      const server = createSymFlowAgeMcpServer();
+      const server = createSymFlowAgeMcpServer(agentScope(req));
       const jsonRpcRequest = req.body;
 
       if (!jsonRpcRequest || typeof jsonRpcRequest !== 'object') {
@@ -1261,9 +1270,9 @@ export function mountMcpRoutes(app: any) {
         } catch (err) {
           // SSE stream closed
         }
-      });
+      }, agentScope(req));
 
-      const server = createSymFlowAgeMcpServer();
+      const server = createSymFlowAgeMcpServer(agentScope(req));
 
       res.on('close', () => {
         unregisterSseAlert();

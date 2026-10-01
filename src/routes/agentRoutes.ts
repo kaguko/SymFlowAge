@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
-import { AgentRequest, requireAgentAuth } from '../middleware/agentAuth.ts';
+import { AgentRequest, requireAgentAuth, agentScope } from '../middleware/agentAuth.ts';
 import { AuthRequest } from '../middleware/auth.ts';
 import { ai, cleanJsonResponse } from '../lib/ai.ts';
 import { serverDriftFeedbackStore, getDriftCalibrationStats } from './driftFeedbackStore.ts';
@@ -275,6 +275,7 @@ agentRouter.post(
       requestId,
       driftScore,
       decision: status,
+      scope: agentScope(req),
       detectedPatterns: detectedRabbitHoles.map((rabbitHole: any) => rabbitHole.rabbitHoleType || rabbitHole.type || rabbitHole.taskTitle),
       recommendedAction: 'Thu hẹp hành động về mục tiêu cốt lõi trước khi tiếp tục',
     });

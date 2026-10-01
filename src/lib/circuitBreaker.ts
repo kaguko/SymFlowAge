@@ -30,7 +30,7 @@ let globalConfig: CircuitBreakerConfig = {
 };
 
 const consecutiveFailureMap = new Map<string, number>();
-const sseSubscribers = new Set<(payload: any) => void>();
+const sseSubscribers = new Set<{ callback: (payload: any) => void; scope: string }>();
 
 export function getCircuitBreakerConfig(): CircuitBreakerConfig {
   return {
@@ -47,10 +47,11 @@ export function updateCircuitBreakerConfig(newConfig: Partial<CircuitBreakerConf
   return getCircuitBreakerConfig();
 }
 
-export function registerSseAlertSubscriber(callback: (payload: any) => void) {
-  sseSubscribers.add(callback);
+export function registerSseAlertSubscriber(callback: (payload: any) => void, scope = 'legacy') {
+  const entry = { callback, scope };
+  sseSubscribers.add(entry);
   return () => {
-    sseSubscribers.delete(callback);
+    sseSubscribers.delete(entry);
   };
 }
 
@@ -76,10 +77,11 @@ export async function sendOutboundWebhook(payload: CircuitBreakerTriggerPayload,
   }
 }
 
-export function notifySseSubscribers(payload: any) {
+export function notifySseSubscribers(payload: any, scope = 'legacy') {
   for (const subscriber of sseSubscribers) {
+    if (subscriber.scope !== scope) continue;
     try {
-      subscriber(payload);
+      subscriber.callback(payload);
     } catch (err) {
       // Ignore subscriber errors
     }
@@ -94,24 +96,29 @@ export interface EvaluateCircuitInput {
   detectedPatterns?: string[];
   recommendedAction?: string;
   customWebhookUrl?: string;
+  /** Isolation scope (see agentScope); defaults to the legacy pool. */
+  scope?: string;
 }
 
 export function evaluateAndTriggerCircuitBreaker(input: EvaluateCircuitInput) {
   const config = getCircuitBreakerConfig();
   const agentId = input.agentId || 'agent_m2m_client';
+  const scope = input.scope || 'legacy';
   const requestId = input.requestId || `req_${Math.random().toString(36).slice(2, 10)}`;
   const driftScore = input.driftScore ?? 0;
   const decision = (input.decision || 'ALLOW').toUpperCase();
   const patterns = input.detectedPatterns || [];
 
   const isFailed = driftScore >= config.maxDriftThreshold || decision === 'BLOCK';
-  let currentFailures = consecutiveFailureMap.get(agentId) || 0;
+  // agent ids are client-chosen, so failure streaks are tracked per scope to stop cross-tenant interference
+  const failureKey = `${scope}:${agentId}`;
+  let currentFailures = consecutiveFailureMap.get(failureKey) || 0;
 
   if (isFailed) {
     currentFailures += 1;
-    consecutiveFailureMap.set(agentId, currentFailures);
+    consecutiveFailureMap.set(failureKey, currentFailures);
   } else {
-    consecutiveFailureMap.set(agentId, 0);
+    consecutiveFailureMap.set(failureKey, 0);
   }
 
   const triggeredByDrift = driftScore >= config.maxDriftThreshold;
@@ -160,7 +167,7 @@ export function evaluateAndTriggerCircuitBreaker(input: EvaluateCircuitInput) {
     }
 
     // Broadcast SSE alerts
-    notifySseSubscribers(sseAlertData);
+    notifySseSubscribers(sseAlertData, scope);
 
     return {
       triggered: true,

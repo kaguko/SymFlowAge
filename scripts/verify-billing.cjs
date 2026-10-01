@@ -28,7 +28,7 @@ async function postJson(path, body, extraHeaders = {}) {
   console.log('metered status=' + m.status + ' remaining=' + m.headers.get('x-quota-remaining') + ' plan=' + m.headers.get('x-tenant-plan'));
 
   console.log('--- 4. usage ---');
-  const u = await fetch(BASE + '/api/billing/usage?tenantId=' + k.json.tenantId).then((r) => r.json());
+  const u = await fetch(BASE + '/api/billing/usage?tenantId=' + k.json.tenantId, { headers: { Authorization: 'Bearer ' + key } }).then((r) => r.json());
   console.log('used=' + u.used + ' quota=' + u.monthlyQuota + ' plan=' + u.planId);
 
   console.log('--- 5. checkout mock (no STRIPE key) ---');
