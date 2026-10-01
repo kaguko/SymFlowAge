@@ -25,7 +25,7 @@ import {
 } from '../lib/circuitBreaker.ts';
 import { insertPredictionOutcome, insertPredictionSnapshot, getPredictionById } from '../db/predictions.ts';
 import { runBacktest, assertThresholds } from '../lib/backtest.ts';
-import { getOrCreateUserRecord, calculateSemanticDriftScore, cosineSimilarity } from '../db/rag.ts';
+import { getOrCreateUserRecord, calculateSemanticDriftScore } from '../db/rag.ts';
 import { smartCache } from '../utils/smartCacheRateLimitEngine.ts';
 
 export const agentRouter = Router();
@@ -270,6 +270,7 @@ agentRouter.post(
         cosineSimilarity: Number(semanticCalculation.cosineSimilarity.toFixed(4)),
         deliveryAlignmentSimilarity: Number(semanticCalculation.deliveryAlignmentSimilarity.toFixed(4)),
         effectiveSimilarity: Number(semanticCalculation.effectiveSimilarity.toFixed(4)),
+        embeddingSource: semanticCalculation.embeddingSource,
       },
       threshold,
       status,

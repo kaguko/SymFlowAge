@@ -729,6 +729,7 @@ Bắt buộc trả về đúng JSON:
             cosineSimilarity: Number(semanticCalculation.cosineSimilarity.toFixed(4)),
             deliveryAlignmentSimilarity: Number(semanticCalculation.deliveryAlignmentSimilarity.toFixed(4)),
             effectiveSimilarity: Number(semanticCalculation.effectiveSimilarity.toFixed(4)),
+            embeddingSource: semanticCalculation.embeddingSource,
           },
           threshold,
           status,

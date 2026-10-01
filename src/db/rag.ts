@@ -146,10 +146,18 @@ export function createDeterministicVector(text: string, dimensions = 768): numbe
   return vector.map((v) => v / norm);
 }
 
+export type EmbeddingSource = 'gemini' | 'deterministic-fallback';
+
 /**
  * Generates 768-dimensional normalized embedding vectors with resilient multi-tier fallback.
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
+  return (await generateEmbeddingWithSource(text)).vector;
+}
+
+export async function generateEmbeddingWithSource(
+  text: string
+): Promise<{ vector: number[]; source: EmbeddingSource }> {
   if (ai) {
     const candidateModels = ['text-embedding-004', 'embedding-001'];
     for (const modelName of candidateModels) {
@@ -160,8 +168,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
         });
         const values = response?.embedding?.values || response?.embeddings?.[0]?.values;
         if (Array.isArray(values) && values.length > 0) {
-          if (values.length === 768) return values;
-          return projectTo768(values);
+          return { vector: values.length === 768 ? values : projectTo768(values), source: 'gemini' };
         }
       } catch {
         // Silently try next model candidate or fallback
@@ -170,7 +177,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
   }
 
   // Resilient 768-dim normalized semantic vector generator (L2 Unit Vector)
-  return createDeterministicVector(text, 768);
+  return { vector: createDeterministicVector(text, 768), source: 'deterministic-fallback' };
 }
 
 export interface SemanticDriftCalculationResult {
@@ -179,6 +186,7 @@ export interface SemanticDriftCalculationResult {
   deliveryAlignmentSimilarity: number;
   effectiveSimilarity: number;
   reason: string;
+  embeddingSource: EmbeddingSource;
 }
 
 /**
@@ -200,15 +208,22 @@ export async function calculateSemanticDriftScore(
       deliveryAlignmentSimilarity: 1.0,
       effectiveSimilarity: 1.0,
       reason: 'Tác vụ đã được người dùng xác nhận là ngoại lệ hợp lệ (Exemption).',
+      embeddingSource: 'gemini',
     };
   }
 
   // 1. Generate 768-dim embeddings in parallel
-  const [goalVec, outputVec, deliveryContextVec] = await Promise.all([
-    generateEmbedding(originalGoal || 'Software Delivery Goal'),
-    generateEmbedding(agentOutput || ''),
-    generateEmbedding(`${originalGoal} software delivery, bug fix, core feature, validation, database, auth, testing, shipping MVP`),
+  const [goalEmb, outputEmb, deliveryEmb] = await Promise.all([
+    generateEmbeddingWithSource(originalGoal || 'Software Delivery Goal'),
+    generateEmbeddingWithSource(agentOutput || ''),
+    generateEmbeddingWithSource(`${originalGoal} software delivery, bug fix, core feature, validation, database, auth, testing, shipping MVP`),
   ]);
+
+  const goalVec = goalEmb.vector;
+  const outputVec = outputEmb.vector;
+  const deliveryContextVec = deliveryEmb.vector;
+  const embeddingSource: EmbeddingSource =
+    [goalEmb, outputEmb, deliveryEmb].every((e) => e.source === 'gemini') ? 'gemini' : 'deterministic-fallback';
 
   // 2. Compute Cosine Similarities
   const directSim = cosineSimilarity(goalVec, outputVec);
@@ -226,6 +241,7 @@ export async function calculateSemanticDriftScore(
       cosineSimilarity: directSim,
       deliveryAlignmentSimilarity: deliverySim,
       effectiveSimilarity: effectiveSim,
+      embeddingSource,
       reason: `Phát hiện bẫy kỹ thuật kiến trúc (${options.detectedRabbitHoles?.map((r) => r.type || r.taskTitle || 'rabbit-hole').join(', ')}).`,
     };
   }
@@ -254,6 +270,7 @@ export async function calculateSemanticDriftScore(
     deliveryAlignmentSimilarity: deliverySim,
     effectiveSimilarity: effectiveSim,
     reason,
+    embeddingSource,
   };
 }
 
