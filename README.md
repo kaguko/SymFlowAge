@@ -85,6 +85,7 @@ Mẫu kết quả với embedding thật (mục tiêu "Build a Node.js payment A
 
 ### Thay đổi mới nhất
 **Khóa bảo mật production**
+- `requireAuth` không còn fallback guest ở production và không bao giờ hạ token sai thành guest.
 - `/api/agent/activity/stream` không còn mở: cần API key (agent/tenant) ở header hoặc ticket dùng một lần; ticket cấp qua `POST /api/agent/activity/ticket` bằng Firebase ID token (UI) hoặc API key.
 - Production không khởi động nếu thiếu `DATABASE_URL`/`SQL_HOST`; in-memory chỉ là chế độ suy giảm khi DB đã cấu hình bị lỗi (có log và đếm tại `/api/health`).
 
@@ -262,7 +263,8 @@ curl -X POST "$APP_URL/api/v1/agent/guardrail/drift-check" \
 
 - **Activity stream**: `GET /api/agent/activity/stream` trả `401` nếu không có credential hợp lệ. Cách vào: (1) header `Authorization: Bearer <API key>` (M2M hoặc `sk_live_…`), hoặc (2) `?ticket=` — ticket một lần, sống 30 giây, lấy bằng `POST /api/agent/activity/ticket` với Firebase ID token (verify nghiêm ngặt, không guest) hoặc API key. Browser dùng `EventSource` nên phải đổi ticket; secret dài hạn không xuất hiện trong URL. UI chỉ kết nối khi người dùng đã đăng nhập Firebase.
 - **Database**: khi `NODE_ENV=production` mà không có `DATABASE_URL`/`SQL_HOST`, server từ chối khởi động. Ngoại lệ tường minh: `SYMFLOWAGE_ALLOW_INMEMORY=1` (chỉ demo, dữ liệu mất khi restart, có log lỗi). Khi DB đã cấu hình nhưng lỗi lúc chạy, các store (`notes`, `users`) tạm dùng in-memory, ghi log `[DB FALLBACK]` và đếm ở `GET /api/health` → `database.fallbackEvents`.
-- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa được tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); `requireAuth` của các route notes vẫn fallback sang guest khi thiếu/sai token; tenant & API key billing đang lưu in-memory (mất khi restart, DB chỉ ghi best-effort); server chưa đọc biến `PORT`.
+- **Auth người dùng (`requireAuth`, dùng cho `/api/notes`, `/api/predict`…)**: production trả `401` khi thiếu token; token sai/hết hạn luôn bị `401` ở mọi môi trường (không còn bị hạ xuống guest). Chế độ guest chỉ bật ở dev, hoặc ở production khi đặt `SYMFLOWAGE_ALLOW_GUEST=1` (demo công khai, mọi guest dùng chung một tài khoản).
+- **Còn tồn đọng (chưa xử lý)**: sự kiện stream chưa được tách theo tenant/user (mọi principal hợp lệ thấy chung luồng); tenant & API key billing đang lưu in-memory (mất khi restart, DB chỉ ghi best-effort); server chưa đọc biến `PORT`.
 
 ---
 
@@ -305,6 +307,7 @@ Firebase Auth (tùy chọn): tạo `.env.local` (đã git-ignored) với `VITE_F
 | `SYMFLOWAGE_WEBHOOK_URL` | Không | Webhook cho Circuit Breaker |
 | `APP_URL` | Không | URL triển khai |
 | `DATABASE_URL` / `SQL_HOST` | **Bắt buộc ở production** | PostgreSQL (pgvector); thiếu thì production không khởi động |
+| `SYMFLOWAGE_ALLOW_GUEST` | Không | `1` cho phép request không token chạy với tài khoản guest ở production (chỉ demo) |
 | `SYMFLOWAGE_ALLOW_INMEMORY` | Không | `1` cho phép production chạy không DB (chỉ demo) |
 | `VITE_FIREBASE_*` | Không | `API_KEY`, `PROJECT_ID`, `AUTH_DOMAIN`, `STORAGE_BUCKET`, `MESSAGING_SENDER_ID`, `APP_ID`, `MEASUREMENT_ID` |
 
