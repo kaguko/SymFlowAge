@@ -447,10 +447,10 @@ Nạp ngay toàn bộ mục tiêu dài hạn, cột mốc và các vi bước h�
   - 🛑 `bike_shedding`: Tốn nhiều ngày chỉnh font chữ, logo, animation thay vì làm tính năng cốt lõi.
   - 🛑 `reinventing_wheel`: Tự viết lại Auth/ORM/Datepicker từ đầu.
   - 🛑 `distraction_task`: Tác vụ phụ phát sinh không đóng góp vào doanh thu/mục tiêu.
-- **Chấm điểm bằng vector embedding**: `driftScore` của guardrail (`/api/v1/agent/guardrail/drift-check` và MCP) được tính từ cosine similarity giữa embedding 768 chiều (Gemini `text-embedding-004`) của mục tiêu và đầu ra agent; rabbit-hole cũng được nhận diện bằng cách so sánh với các archetype (over-engineering, premature optimization, bike-shedding, reinventing-wheel) trong không gian vector, danh sách từ khóa chỉ là bằng chứng bổ sung.
+- **Chấm điểm bằng vector embedding**: `driftScore` của guardrail (`/api/v1/agent/guardrail/drift-check` và MCP) được tính từ cosine similarity giữa embedding 768 chiều (Gemini `gemini-embedding-001`, cắt về 768 chiều) của mục tiêu và đầu ra agent; rabbit-hole cũng được nhận diện bằng cách so sánh với các archetype (over-engineering, premature optimization, bike-shedding, reinventing-wheel) trong không gian vector, danh sách từ khóa chỉ là bằng chứng bổ sung.
   - Response có `semanticMetrics.embeddingSource`: `gemini` (semantic thật) hoặc `deterministic-fallback` (khi không có `GEMINI_API_KEY`/API lỗi — chỉ là hash từ khóa + trigram, **không** phải semantic thật và không chạy so khớp archetype).
   - Đặt `SYMFLOWAGE_REQUIRE_SEMANTIC=1` để guardrail trả `503 SEMANTIC_UNAVAILABLE` thay vì âm thầm dùng fallback.
-  - Các hằng số ngưỡng (`0.5` similarity, `0.08` margin) chưa được calibrate trên dữ liệu thật.
+  - Các hằng số ngưỡng (`0.6` similarity, `0.12` margin) chưa được calibrate trên dữ liệu thật.
 - **Cảnh báo trực quan**: Tự động chuyển thanh tiến độ sang **Màu Vàng Cảnh Báo** khi độ tập trung $< 50\%$ hoặc có từ 2 Rabbit Holes trở lên, kèm giải thích lý do vì sao là bẫy và gợi ý phương án tinh gọn thay thế.
 - **Cơ Chế Học Hỏi & Khử Báo Động Giả (Active Calibration & False Positive Feedback Loop)**:
   - Nút **"Đây KHÔNG PHẢI Rabbit Hole (Báo False Positive)"** cho phép Solo Dev gắn cờ các tác vụ quan trọng (bảo mật OWASP, Stripe, kiến trúc lõi) bị AI đánh giá nhầm.

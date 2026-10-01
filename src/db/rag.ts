@@ -159,16 +159,23 @@ export async function generateEmbeddingWithSource(
   text: string
 ): Promise<{ vector: number[]; source: EmbeddingSource }> {
   if (ai) {
-    const candidateModels = ['text-embedding-004', 'embedding-001'];
+    // text-embedding-004 / embedding-001 are retired (404 on embedContent); keep as last-resort candidates.
+    const candidateModels = ['gemini-embedding-001', 'text-embedding-004'];
     for (const modelName of candidateModels) {
       try {
         const response: any = await ai.models.embedContent({
           model: modelName,
           contents: text,
+          config: { outputDimensionality: 768 },
         });
         const values = response?.embedding?.values || response?.embeddings?.[0]?.values;
         if (Array.isArray(values) && values.length > 0) {
-          return { vector: values.length === 768 ? values : projectTo768(values), source: 'gemini' };
+          if (values.length === 768) {
+            // Truncated (MRL) embeddings are not unit-length; normalise so cosine is well-behaved.
+            const norm = Math.sqrt(values.reduce((sum: number, v: number) => sum + v * v, 0)) || 1;
+            return { vector: values.map((v: number) => v / norm), source: 'gemini' };
+          }
+          return { vector: projectTo768(values), source: 'gemini' };
         }
       } catch {
         // Silently try next model candidate or fallback
@@ -212,8 +219,8 @@ const RABBIT_HOLE_PROTOTYPES: Array<{ type: string; text: string; reason: string
   },
 ];
 
-const SEMANTIC_RABBIT_HOLE_MIN_SIM = 0.5;
-const SEMANTIC_RABBIT_HOLE_MIN_MARGIN = 0.08;
+const SEMANTIC_RABBIT_HOLE_MIN_SIM = 0.6;
+const SEMANTIC_RABBIT_HOLE_MIN_MARGIN = 0.12;
 const prototypeEmbeddingCache = new Map<string, Promise<{ vector: number[]; source: EmbeddingSource }>>();
 
 function embedPrototype(text: string) {
@@ -309,10 +316,10 @@ export async function calculateSemanticDriftScore(
   const keywordHit = !!options.detectedRabbitHoles && options.detectedRabbitHoles.length > 0;
   if (keywordHit || semanticRabbitHoles.length > 0) {
     // Continuous score driven by how much closer the output is to a rabbit-hole archetype than to the goal.
-    // A literal keyword match is corroborating evidence and is treated as at least a 0.1 margin.
+    // A literal keyword match is corroborating evidence and is treated as at least a 0.15 margin.
     const bestRabbitSim = semanticRabbitHoles[0]?.similarity ?? 0;
-    const margin = Math.max(bestRabbitSim - directSim, keywordHit ? 0.1 : 0);
-    const calculatedPenalty = Math.min(95, Math.max(60, Math.round(60 + margin * 150 + (1 - directSim) * 15)));
+    const margin = Math.max(bestRabbitSim - directSim, keywordHit ? 0.15 : 0);
+    const calculatedPenalty = Math.min(95, Math.max(60, Math.round(55 + margin * 100 + (1 - directSim) * 10)));
     const labels = [
       ...(options.detectedRabbitHoles || []).map((r) => r.type || r.taskTitle || 'rabbit-hole'),
       ...semanticRabbitHoles.map((r) => `${r.rabbitHoleType} ~${(r.similarity * 100).toFixed(0)}%`),
