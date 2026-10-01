@@ -180,6 +180,59 @@ export async function generateEmbeddingWithSource(
   return { vector: createDeterministicVector(text, 768), source: 'deterministic-fallback' };
 }
 
+export class SemanticUnavailableError extends Error {
+  constructor() {
+    super('Semantic embeddings unavailable (no Gemini embedding) and SYMFLOWAGE_REQUIRE_SEMANTIC=1.');
+    this.name = 'SemanticUnavailableError';
+  }
+}
+
+// Archetypes of developer rabbit holes. The agent output is compared against these in vector space,
+// so paraphrases the keyword list never saw ("set up a cluster orchestrator") are still caught.
+const RABBIT_HOLE_PROTOTYPES: Array<{ type: string; text: string; reason: string }> = [
+  {
+    type: 'over_engineering',
+    text: 'Set up kubernetes, microservices, service mesh, multi-region clusters, CQRS, sharding and heavy infrastructure before having any users',
+    reason: 'Kiến trúc/hạ tầng quy mô lớn trước khi MVP có người dùng thực tế.',
+  },
+  {
+    type: 'premature_optimization',
+    text: 'Micro-optimize latency, build multi-layer custom caches and tune performance before any load test or measured bottleneck',
+    reason: 'Tối ưu hiệu năng trước khi có số liệu đo lường.',
+  },
+  {
+    type: 'bike_shedding',
+    text: 'Polish logo, theme, dark mode, gradients, animations and landing page visuals instead of building the core feature',
+    reason: 'Chỉnh giao diện/thẩm mỹ thay vì hoàn thiện tính năng cốt lõi.',
+  },
+  {
+    type: 'reinventing_wheel',
+    text: 'Write our own ORM, auth framework, datepicker or standard library from scratch instead of using an existing well-known library',
+    reason: 'Tự viết lại thứ thư viện chuẩn đã có sẵn.',
+  },
+];
+
+const SEMANTIC_RABBIT_HOLE_MIN_SIM = 0.5;
+const SEMANTIC_RABBIT_HOLE_MIN_MARGIN = 0.08;
+const prototypeEmbeddingCache = new Map<string, Promise<{ vector: number[]; source: EmbeddingSource }>>();
+
+function embedPrototype(text: string) {
+  let cached = prototypeEmbeddingCache.get(text);
+  if (!cached) {
+    cached = generateEmbeddingWithSource(text);
+    prototypeEmbeddingCache.set(text, cached);
+    // Do not pin a failed/fallback result forever
+    cached.then((r) => r.source !== 'gemini' && prototypeEmbeddingCache.delete(text)).catch(() => prototypeEmbeddingCache.delete(text));
+  }
+  return cached;
+}
+
+export interface SemanticRabbitHole {
+  rabbitHoleType: string;
+  similarity: number;
+  whyItsATrap: string;
+}
+
 export interface SemanticDriftCalculationResult {
   driftScore: number;
   cosineSimilarity: number;
@@ -187,6 +240,7 @@ export interface SemanticDriftCalculationResult {
   effectiveSimilarity: number;
   reason: string;
   embeddingSource: EmbeddingSource;
+  semanticRabbitHoles: SemanticRabbitHole[];
 }
 
 /**
@@ -209,6 +263,7 @@ export async function calculateSemanticDriftScore(
       effectiveSimilarity: 1.0,
       reason: 'Tác vụ đã được người dùng xác nhận là ngoại lệ hợp lệ (Exemption).',
       embeddingSource: 'gemini',
+      semanticRabbitHoles: [],
     };
   }
 
@@ -230,19 +285,46 @@ export async function calculateSemanticDriftScore(
   const deliverySim = cosineSimilarity(deliveryContextVec, outputVec);
   const effectiveSim = Math.max(directSim, deliverySim);
 
-  // 3. Evaluate Rabbit Hole Penalities
-  const hasRabbitHole = options.detectedRabbitHoles && options.detectedRabbitHoles.length > 0;
-  if (hasRabbitHole) {
-    // Destructive diversion (over-engineering, premature optimization, reinventing the wheel)
-    // Continuous score scaled from vector divergence
-    const calculatedPenalty = Math.min(95, Math.max(75, Math.round(75 + (1 - directSim) * 20)));
+  if (process.env.SYMFLOWAGE_REQUIRE_SEMANTIC === '1' && embeddingSource !== 'gemini') {
+    throw new SemanticUnavailableError();
+  }
+
+  // 3. Rabbit-hole detection in vector space (only meaningful with real embeddings).
+  const semanticRabbitHoles: SemanticRabbitHole[] = [];
+  if (embeddingSource === 'gemini') {
+    const protos = await Promise.all(RABBIT_HOLE_PROTOTYPES.map((p) => embedPrototype(p.text)));
+    protos.forEach((p, i) => {
+      const sim = cosineSimilarity(p.vector, outputVec);
+      if (sim >= SEMANTIC_RABBIT_HOLE_MIN_SIM && sim - directSim >= SEMANTIC_RABBIT_HOLE_MIN_MARGIN) {
+        semanticRabbitHoles.push({
+          rabbitHoleType: RABBIT_HOLE_PROTOTYPES[i].type,
+          similarity: sim,
+          whyItsATrap: RABBIT_HOLE_PROTOTYPES[i].reason,
+        });
+      }
+    });
+    semanticRabbitHoles.sort((a, b) => b.similarity - a.similarity);
+  }
+
+  const keywordHit = !!options.detectedRabbitHoles && options.detectedRabbitHoles.length > 0;
+  if (keywordHit || semanticRabbitHoles.length > 0) {
+    // Continuous score driven by how much closer the output is to a rabbit-hole archetype than to the goal.
+    // A literal keyword match is corroborating evidence and is treated as at least a 0.1 margin.
+    const bestRabbitSim = semanticRabbitHoles[0]?.similarity ?? 0;
+    const margin = Math.max(bestRabbitSim - directSim, keywordHit ? 0.1 : 0);
+    const calculatedPenalty = Math.min(95, Math.max(60, Math.round(60 + margin * 150 + (1 - directSim) * 15)));
+    const labels = [
+      ...(options.detectedRabbitHoles || []).map((r) => r.type || r.taskTitle || 'rabbit-hole'),
+      ...semanticRabbitHoles.map((r) => `${r.rabbitHoleType} ~${(r.similarity * 100).toFixed(0)}%`),
+    ];
     return {
       driftScore: calculatedPenalty,
       cosineSimilarity: directSim,
       deliveryAlignmentSimilarity: deliverySim,
       effectiveSimilarity: effectiveSim,
       embeddingSource,
-      reason: `Phát hiện bẫy kỹ thuật kiến trúc (${options.detectedRabbitHoles?.map((r) => r.type || r.taskTitle || 'rabbit-hole').join(', ')}).`,
+      semanticRabbitHoles,
+      reason: `Phát hiện bẫy kỹ thuật kiến trúc (${labels.join(', ')}).`,
     };
   }
 
@@ -271,6 +353,7 @@ export async function calculateSemanticDriftScore(
     effectiveSimilarity: effectiveSim,
     reason,
     embeddingSource,
+    semanticRabbitHoles,
   };
 }
 

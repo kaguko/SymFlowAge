@@ -715,6 +715,18 @@ Bắt buộc trả về đúng JSON:
           detectedRabbitHoles: semantic.detectedRabbitHoles,
           isExempted,
         });
+        const detectedRabbitHoles = [
+          ...semantic.detectedRabbitHoles,
+          ...semanticCalculation.semanticRabbitHoles.map((r) => ({
+            taskId: 'agent-output',
+            taskTitle: agentOutput,
+            rabbitHoleType: r.rabbitHoleType,
+            severity: 'high',
+            similarity: Number(r.similarity.toFixed(4)),
+            whyItsATrap: r.whyItsATrap,
+            detectedBy: 'embedding',
+          })),
+        ];
 
         const driftScore = semanticCalculation.driftScore;
         const status = driftScore >= threshold ? 'BLOCK' : 'ALLOW';
@@ -735,7 +747,7 @@ Bắt buộc trả về đúng JSON:
           status,
           decision: status,
           isExempted,
-          detectedRabbitHoles: semantic.detectedRabbitHoles,
+          detectedRabbitHoles,
           calibrationStats: getDriftCalibrationStats(),
           reason:
             status === 'BLOCK'

@@ -25,7 +25,7 @@ import {
 } from '../lib/circuitBreaker.ts';
 import { insertPredictionOutcome, insertPredictionSnapshot, getPredictionById } from '../db/predictions.ts';
 import { runBacktest, assertThresholds } from '../lib/backtest.ts';
-import { getOrCreateUserRecord, calculateSemanticDriftScore } from '../db/rag.ts';
+import { getOrCreateUserRecord, calculateSemanticDriftScore, SemanticUnavailableError } from '../db/rag.ts';
 import { smartCache } from '../utils/smartCacheRateLimitEngine.ts';
 
 export const agentRouter = Router();
@@ -240,10 +240,30 @@ agentRouter.post(
     );
 
     // Real Vector Space Semantic Evaluation (768-dim embeddings + cosineSimilarity from src/db/rag.ts)
-    const semanticCalculation = await calculateSemanticDriftScore(originalGoal, agentOutput, {
-      detectedRabbitHoles: semantic.detectedRabbitHoles,
-      isExempted,
-    });
+    let semanticCalculation;
+    try {
+      semanticCalculation = await calculateSemanticDriftScore(originalGoal, agentOutput, {
+        detectedRabbitHoles: semantic.detectedRabbitHoles,
+        isExempted,
+      });
+    } catch (error) {
+      if (error instanceof SemanticUnavailableError) {
+        return res.status(503).json({ error: error.message, code: 'SEMANTIC_UNAVAILABLE' });
+      }
+      throw error;
+    }
+    const detectedRabbitHoles = [
+      ...semantic.detectedRabbitHoles,
+      ...semanticCalculation.semanticRabbitHoles.map((r) => ({
+        taskId: 'agent-output',
+        taskTitle: agentOutput,
+        rabbitHoleType: r.rabbitHoleType,
+        severity: 'high',
+        similarity: Number(r.similarity.toFixed(4)),
+        whyItsATrap: r.whyItsATrap,
+        detectedBy: 'embedding',
+      })),
+    ];
 
     const driftScore = semanticCalculation.driftScore;
 
@@ -255,7 +275,7 @@ agentRouter.post(
       requestId,
       driftScore,
       decision: status,
-      detectedPatterns: semantic.detectedRabbitHoles.map((rabbitHole: any) => rabbitHole.type || rabbitHole.taskTitle),
+      detectedPatterns: detectedRabbitHoles.map((rabbitHole: any) => rabbitHole.rabbitHoleType || rabbitHole.type || rabbitHole.taskTitle),
       recommendedAction: 'Thu hẹp hành động về mục tiêu cốt lõi trước khi tiếp tục',
     });
 
@@ -276,7 +296,7 @@ agentRouter.post(
       status,
       decision: status,
       isExempted,
-      detectedRabbitHoles: semantic.detectedRabbitHoles,
+      detectedRabbitHoles,
       calibrationStats: getDriftCalibrationStats(),
       reason:
         status === 'BLOCK'
